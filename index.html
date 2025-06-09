@@ -197,8 +197,6 @@
         setStatus('切断されました');
         connected = false;
         connecting = false;
-        document.getElementById('connectbtn').textContent = '接続';
-        setFormLock(false);
         location.reload();
       };
       ws.onerror = () => setStatus('エラーが発生しました');
