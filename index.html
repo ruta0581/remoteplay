@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>ゲームパッドクライアント</title>
+  <style>
+    html, body {
+      margin: 0; padding: 0;
+      background: #f4f7fa;
+      width: 100vw; min-height: 100vh;
+    }
+    #pad-status {
+      position: fixed; left: 18px; top: 18px; width: 10px; height: 10px; z-index: 9999;
+    }
+    #pad-status-indicator {
+      display: block; width: 8px; height: 8px; border-radius: 4px;
+      border: 1px solid #888; background: #888; transition: background 0.2s;
+    }
+    .ninja-container {
+      width: 100vw; max-width: 100vw;
+      margin: 0 auto 16px auto;
+      display: flex; justify-content: center;
+    }
+    #vdo-ninja {
+      width: 100vw; max-width: 1280px; aspect-ratio: 16/9;
+      height: auto; max-height: 720px;
+      background: #000; border: 0; display: block;
+    }
+    @media (max-width: 1280px) {
+      #vdo-ninja { width: 100vw; height: calc(100vw * 9 / 16); }
+    }
+    h2, form, #status {
+      max-width: 800px;
+      margin-left: auto; margin-right: auto; text-align: center;
+    }
+    form { margin-top: 24px; }
+    .formblock { display: block; margin-top: 10px; }
+    .big-btn {
+      display: block; width: 100%; max-width: 500px;
+      margin: 24px auto 0 auto;
+      font-size: 2.2em; padding: 22px 0;
+      background: #2196f3; color: #fff;
+      border: none; border-radius: 14px;
+      font-weight: bold; letter-spacing: 0.08em;
+      cursor: pointer;
+      transition: background 0.18s;
+    }
+    .big-btn:hover:enabled { background: #1565c0; }
+    .big-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    label { margin-right: 12px; }
+    select, input[type=text], input[type=number] { font-size: 1.1em; padding: 4px 8px; }
+    #refreshPad { font-size: 0.95em; padding: 5px 12px; margin-left: 8px; }
+    #status { margin-top: 24px; }
+  </style>
+</head>
+<body>
+  <div id="pad-status">
+    <span id="pad-status-indicator"></span>
+  </div>
+  <div class="ninja-container">
+    <iframe
+      id="vdo-ninja"
+      src="about:blank"
+      allow="camera; microphone; fullscreen; autoplay"
+      frameborder="0"
+      allowfullscreen
+      style="border:0; display:block;">
+    </iframe>
+  </div>
+  <h2>クライアント接続</h2>
+  <form id="connectform" onsubmit="return false;">
+    <label>名前: <input type="text" id="uname" required></label>
+    <label>ホストIP/ダイナミックDNS: 
+      <input type="text" id="hostip" value="localhost" required>
+      <span style="color:#999; font-size:0.95em;">
+        (サーバーで指定したDDNSを入力)
+      </span>
+    </label>
+    <label>ポート番号:
+      <input type="number" id="portInput" min="1" max="65535" value="3333">
+      <span style="color:#999; font-size:0.95em;">
+        (サーバーで指定したポート番号を入力)
+      </span>
+    </label>
+    <span class="formblock"></span>
+    <label>使用ゲームパッド: 
+      <select id="padSelect"></select>
+    </label>
+    <button type="button" id="refreshPad">再検出</button>
+    <span class="formblock"></span>
+    <button id="connectbtn" class="big-btn" disabled>接続</button>
+  </form>
+  <div id="status"></div>
+  <script>
+    let ws = null;
+    let sent = 0;
+    let connected = false;
+    let connecting = false;
+    let padIndex = null;
+    let ninjaView = null;
+    let lastInput = 0;
+
+    function updatePadIndicator(active) {
+      const el = document.getElementById('pad-status-indicator');
+      el.style.background = active ? '#2ecc40' : '#888';
+    }
+
+    function setFormLock(isLock) {
+      document.getElementById('uname').disabled = isLock;
+      document.getElementById('hostip').disabled = isLock;
+      document.getElementById('portInput').disabled = isLock;
+      document.getElementById('padSelect').disabled = isLock;
+      document.getElementById('refreshPad').disabled = isLock;
+    }
+
+    function setStatus(text) {
+      if (text.startsWith('送信中:')) {
+        document.getElementById('status').textContent = '送信中...';
+      } else {
+        document.getElementById('status').textContent = text;
+      }
+    }
+
+    function refreshPadList() {
+      const pads = navigator.getGamepads();
+      const sel = document.getElementById('padSelect');
+      sel.innerHTML = "";
+      let found = false;
+      for (let i = 0; i < pads.length; i++) {
+        if (pads[i]) {
+          const opt = document.createElement("option");
+          opt.value = i;
+          opt.textContent = `[${i}] ${pads[i].id}`;
+          sel.appendChild(opt);
+          found = true;
+        }
+      }
+      if (!found) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "ゲームパッド未検出";
+        sel.appendChild(opt);
+      }
+      document.getElementById("connectbtn").disabled = !found;
+    }
+    window.addEventListener("gamepadconnected", refreshPadList);
+    window.addEventListener("gamepaddisconnected", refreshPadList);
+    document.getElementById("refreshPad").onclick = refreshPadList;
+    refreshPadList();
+
+    document.getElementById('connectbtn').onclick = () => {
+      if (connected || connecting) {
+        location.reload();
+        return;
+      }
+      connecting = true;
+      setFormLock(true);
+      document.getElementById('connectbtn').textContent = '切断';
+      setStatus('コントローラー操作待ち...');
+      padIndex = parseInt(document.getElementById('padSelect').value);
+      watchPad();
+    };
+
+    function watchPad() {
+      let found = false;
+      function loop() {
+        const pads = navigator.getGamepads();
+        const pad = pads[padIndex];
+        if (pad) {
+          if (pad.buttons.some(btn => btn.pressed)) {
+            found = true;
+            startWS(pad);
+            return;
+          }
+        }
+        if (!found) requestAnimationFrame(loop);
+      }
+      loop();
+    }
+
+    function startWS(pad) {
+      const name = document.getElementById('uname').value.trim();
+      const host = document.getElementById('hostip').value.trim();
+      const port = document.getElementById('portInput').value || "3333";
+      ws = new WebSocket(`ws://${host}:${port}/`);
+      ws.binaryType = "arraybuffer";
+      ws.onopen = () => {
+        connected = true;
+        connecting = false;
+        document.getElementById('connectbtn').textContent = '切断';
+        setStatus('接続中...');
+        setFormLock(true);
+        ws.send(JSON.stringify({ type: "hello", name: name, id: pad.id }));
+        startSending();
+      };
+      ws.onclose = () => {
+        setStatus('切断されました');
+        connected = false;
+        connecting = false;
+        document.getElementById('connectbtn').textContent = '接続';
+        setFormLock(false);
+      };
+      ws.onerror = () => setStatus('エラーが発生しました');
+
+      ws.onmessage = ev => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (data.type === "ninja_url") {
+            ninjaView = data.view;
+            document.getElementById('vdo-ninja').src =
+              "https://vdo.ninja/?view=" + ninjaView + "&nojitter";
+            // サーバー案内のddns, portも案内表示(自動入力はしない)
+          }
+        } catch {}
+      };
+    }
+
+    // --- バイナリ＋差分送信 ---
+    function encodeGamepadData(pad) {
+      let btnBits = 0;
+      for (let i = 0; i < 16; i++) {
+        if (pad.buttons[i]?.pressed) btnBits |= (1 << i);
+      }
+      const axes = [];
+      for (let i = 0; i < 4; i++) {
+        let v = Math.round((pad.axes[i] ?? 0) * 127);
+        v = Math.max(-128, Math.min(127, v));
+        axes.push(v);
+      }
+      let lt = 0, rt = 0;
+      if (pad.buttons[6]) lt = Math.round((pad.buttons[6].value ?? 0) * 255);
+      else if (pad.axes[4] !== undefined) lt = Math.round(((pad.axes[4] + 1) / 2) * 255);
+      if (pad.buttons[7]) rt = Math.round((pad.buttons[7].value ?? 0) * 255);
+      else if (pad.axes[5] !== undefined) rt = Math.round(((pad.axes[5] + 1) / 2) * 255);
+      lt = Math.max(0, Math.min(255, lt));
+      rt = Math.max(0, Math.min(255, rt));
+
+      const buf = new Uint8Array(8);
+      buf[0] = btnBits & 0xFF;
+      buf[1] = (btnBits >> 8) & 0xFF;
+      buf[2] = axes[0] & 0xFF;
+      buf[3] = axes[1] & 0xFF;
+      buf[4] = axes[2] & 0xFF;
+      buf[5] = axes[3] & 0xFF;
+      buf[6] = lt & 0xFF;
+      buf[7] = rt & 0xFF;
+      return buf;
+    }
+    function isPadNeutral(pad) {
+      for (let i = 0; i < 16; i++) {
+        if (pad.buttons[i]?.pressed) return false;
+      }
+      const DEADZONE = 0.07;
+      for (let i = 0; i < 4; i++) {
+        if (Math.abs(pad.axes[i] ?? 0) > DEADZONE) return false;
+      }
+      if ((pad.buttons[6]?.value ?? 0) > 0.01) return false;
+      if ((pad.buttons[7]?.value ?? 0) > 0.01) return false;
+      return true;
+    }
+    function startSending() {
+      let prev = null;
+      function loop() {
+        const pad = navigator.getGamepads()[padIndex];
+        let active = false;
+        if (pad && ws && ws.readyState === 1) {
+          active = !isPadNeutral(pad);
+          const buf = encodeGamepadData(pad);
+          let diff = false;
+          if (!prev) diff = true;
+          else for (let i = 0; i < buf.length; i++) {
+            if (buf[i] !== prev[i]) { diff = true; break; }
+          }
+          if (diff) {
+            ws.send(buf.buffer);
+            prev = buf;
+            sent++;
+            setStatus('送信中:');
+          }
+        }
+        updatePadIndicator(active);
+        if (connected) requestAnimationFrame(loop);
+      }
+      loop();
+    }
+  </script>
+</body>
+</html>
