@@ -221,7 +221,7 @@
             if (buf[i] != prev[i]) { diff = true; break; }
           }
           if (diff) {
-            ws.send(JSON.stringify({ type: "pad", hostid: hostid, buf: Array.from(buf) }));
+            ws.send(JSON.stringify({ type: "pad", hostid: hostid, clientid: clientID, buf: Array.from(buf) }));
             prev = buf;
             sent++;
             setStatus('送信中:');
