@@ -2,355 +2,214 @@
 <html lang="ja">
 <head>
   <meta charset="utf-8">
-  <title>リモートプレイクライアント</title>
+  <title>RemotePad クライアント</title>
   <style>
-    html, body { margin:0; padding:0; background:#f4f7fa; width:100vw; min-height:100vh; }
-    #pad-status { position:fixed; left:18px; top:18px; width:10px; height:10px; z-index:9999; }
-    #pad-status-indicator { display:block; width:8px; height:8px; border-radius:4px; border:1px solid #888; background:#888; transition:background 0.2s; }
-    h2, form, #status { max-width:800px; margin-left:auto; margin-right:auto; text-align:center; }
-    form { margin-top:24px; }
-    .formblock { display:block; margin-top:10px; }
-    .big-btn { display:block; width:100%; max-width:500px; margin:24px auto 0 auto; font-size:2.2em; padding:22px 0; background:#2196f3; color:#fff; border:none; border-radius:14px; font-weight:bold; letter-spacing:0.08em; cursor:pointer; transition:background 0.18s; }
-    .big-btn:hover:enabled { background:#1565c0; }
-    .big-btn:disabled { opacity:0.5; cursor:not-allowed; }
-    label { margin-right:12px; }
-    select, input[type=text] { font-size:1.1em; padding:4px 8px; }
-    #refreshPad { font-size:0.95em; padding:5px 12px; margin-left:8px; }
-    #status { margin-top:24px; }
-    #vdo-wrap {
-      margin: 0 auto 0 auto;
-      width: 100vw;
-      max-width: 100vw;
-      aspect-ratio: 16/9;
-      background: #222;
-      overflow: hidden;
-      display: flex; align-items: center; justify-content: center;
-      border: none;
-    }
-    #vdo-iframe {
-      width: 100%; height: 100%; border: none;
-      background: #222;
-      display: block;
-      border-radius: 0 !important;
-    }
+    body { font-family: 'Segoe UI', sans-serif; background: #f5f7fa; margin: 0; padding: 0; }
+    .main { max-width: 600px; margin: 24px auto; background: #fff; border-radius: 10px; box-shadow: 0 0 10px #bbb; padding: 28px; }
+    h2 { margin-top: 0; }
+    .row { display: flex; gap: 14px; align-items: center; margin-bottom: 12px; }
+    .label { min-width: 72px; text-align: right; }
+    #pad-indicator { display:inline-block; border-radius:50%; width:22px; height:22px; margin-left:8px; background:#aaa; vertical-align:middle; transition:background 0.1s; }
+    #pad-indicator.active { background:#2ecc40; }
+    #vdo-iframe { width:100%; min-height:240px; border:1px solid #aaa; border-radius:10px; margin-top:18px;}
+    #connectbtn { min-width:92px; font-size:1em; padding:6px 16px; border-radius:8px; border:none; font-weight:bold; cursor:pointer;}
+    .err { color:#d33; margin-left:10px;}
+    .status { font-size:0.98em; color:#008;}
+    #gamepad-select, #wsl-addr, #username { font-size:1em; }
   </style>
 </head>
 <body>
-  <div id="pad-status">
-    <span id="pad-status-indicator"></span>
-  </div>
-  <div id="vdo-wrap">
+  <div class="main">
+    <h2>RemotePad クライアント</h2>
+    <div class="row">
+      <span class="label">名前</span>
+      <input id="username" maxlength="10" style="flex:1;">
+      <span id="nameerr" class="err"></span>
+    </div>
+    <div class="row">
+      <span class="label">WSLアドレス</span>
+      <input id="wsl-addr" style="flex:1;">
+    </div>
+    <div class="row">
+      <span class="label">ゲームパッド</span>
+      <select id="gamepad-select" style="flex:1;"></select>
+      <span id="pad-indicator"></span>
+    </div>
+    <div class="row">
+      <button id="connectbtn" style="background:#2196f3;color:#fff;">接続</button>
+      <span id="status" class="status"></span>
+    </div>
     <iframe id="vdo-iframe" allow="autoplay; fullscreen"></iframe>
   </div>
-<form id="connectform" onsubmit="return false;">
-  <div style="display: table; margin: 0 auto;">
-    <div style="display: table-row;">
-      <label style="display: table-cell; padding: 6px 10px; text-align:right;">名前:</label>
-      <div style="display: table-cell;">
-        <input type="text" id="uname" required autocomplete="off" style="width: 24em; max-width: 90vw;">
-        <div id="name-error" style="color:red; font-size:1em; min-height:1.4em; height:1.4em;"></div>
-      </div>
-    </div>
-    <div style="display: table-row;">
-      <label style="display: table-cell; padding: 6px 10px; text-align:right;">wslアドレス:</label>
-      <div style="display: table-cell;">
-        <input type="text" id="wsl" placeholder="https://..." autocomplete="off" style="width: 24em; max-width: 90vw;">
-        <div style="color:red; font-size:1em; min-height:1.4em; height:1.4em;"></div>
-      </div>
-    </div>
-    <div style="display: table-row;">
-      <label style="display: table-cell; padding: 6px 10px; text-align:right;">使用ゲームパッド:</label>
-      <div style="display: table-cell;">
-        <div style="display: flex; align-items: center; min-width: 12em;">
-          <select id="padSelect" style="min-width: 10em; max-width: 20em;"></select>
-          <button type="button" id="refreshPad" style="margin-left:8px;">再検出</button>
-        </div>
-      </div>
-    </div>
-  </div>
-  <span class="formblock"></span>
-  <button id="connectbtn" class="big-btn" disabled>接続</button>
-</form>
+<script>
+let ws = null, pc = null, dataChannel = null;
+let connected = false, connecting = false;
+let lastPadActive = false;
 
+function setFormLock(lock) {
+  document.getElementById('username').disabled = lock;
+  document.getElementById('wsl-addr').disabled = lock;
+  document.getElementById('gamepad-select').disabled = lock;
+}
 
-  <div id="status"></div>
-  <script>
-    let ws = null, pc = null, dataChannel = null;
-    let connected = false, connecting = false, padIndex = null;
-    let lastPadSelect = 0;
-    let padList = [];
-    let wslURL = "";
-    let vdoID = "";
-    let padSelectEl = document.getElementById("padSelect");
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg || "";
+}
 
-    function updatePadIndicator(active) {
-      document.getElementById('pad-status-indicator').style.background = active ? '#2ecc40' : '#888';
+function updatePadIndicator(active) {
+  const el = document.getElementById('pad-indicator');
+  el.className = active ? "active" : "";
+}
+
+function refreshPadList() {
+  const select = document.getElementById('gamepad-select');
+  const pads = navigator.getGamepads();
+  select.innerHTML = "";
+  let found = false;
+  for (let i = 0; i < pads.length; ++i) {
+    const p = pads[i];
+    if (p && p.connected) {
+      const opt = document.createElement('option');
+      opt.value = i;
+      opt.textContent = `#${i}: ${p.id}`;
+      select.appendChild(opt);
+      found = true;
     }
-    function setFormLock(isLock) {
-      document.getElementById('uname').disabled = isLock;
-      document.getElementById('wsl').disabled = isLock;
-      document.getElementById('padSelect').disabled = isLock;
-      document.getElementById('refreshPad').disabled = isLock;
-    }
+  }
+  if (!found) {
+    const opt = document.createElement('option');
+    opt.value = "";
+    opt.textContent = "ゲームパッド未接続";
+    select.appendChild(opt);
+  }
+}
+window.addEventListener('gamepadconnected', refreshPadList);
+window.addEventListener('gamepaddisconnected', refreshPadList);
+refreshPadList();
 
-    // -- 名前バリデーション+パッド状態による有効化
-    function validateNameAndPad() {
-      const nameInput = document.getElementById('uname');
-      const errorDiv = document.getElementById('name-error');
-      const connectBtn = document.getElementById('connectbtn');
-      const padOK = document.getElementById('padSelect').options.length && document.getElementById('padSelect').value !== "";
-      if (nameInput.value.length > 10) {
-        errorDiv.textContent = "※名前は10文字以内にしてください";
-        connectBtn.disabled = true;
-      } else if (!padOK) {
-        errorDiv.textContent = "";
-        connectBtn.disabled = true;
-      } else {
-        errorDiv.textContent = "";
-        connectBtn.disabled = false;
-      }
-    }
-    document.getElementById('uname').addEventListener('input', validateNameAndPad);
-    document.getElementById('padSelect').addEventListener('change', validateNameAndPad);
-    document.getElementById('refreshPad').addEventListener('click', function() {
-      setTimeout(validateNameAndPad, 10);
-    });
-    window.addEventListener('DOMContentLoaded', validateNameAndPad);
+function disconnectCleanup() {
+  if (dataChannel && dataChannel.readyState === "open") try { dataChannel.close(); } catch {}
+  if (pc) try { pc.close(); } catch {}
+  if (ws && ws.readyState <= 1) try { ws.close(); } catch {}
+  dataChannel = null;
+  pc = null;
+  ws = null;
+  connected = false;
+  connecting = false;
+  setFormLock(false);
+  document.getElementById('connectbtn').textContent = '接続';
+  setStatus('切断しました');
+  updatePadIndicator(false);
+  refreshPadList();
+  document.getElementById("vdo-iframe").src = "";
+}
 
-    function setStatus(text) { document.getElementById('status').textContent = text; }
-    function refreshPadList() {
-      if (connected) return;
-      padList = [];
-      const pads = navigator.getGamepads();
-      padSelectEl.innerHTML = "";
-      let found = false;
-      for (let i = 0; i < pads.length; i++) {
-        if (pads[i]) {
-          const opt = document.createElement("option");
-          opt.value = i;
-          opt.textContent = `[${i}] ${pads[i].id}`;
-          padSelectEl.appendChild(opt);
-          padList.push(pads[i]);
-          found = true;
-        }
-      }
-      if (!found) {
-        const opt = document.createElement("option");
-        opt.value = "";
-        opt.textContent = "ゲームパッド未検出";
-        padSelectEl.appendChild(opt);
-      }
-      // バリデーション実行でpad接続時のボタン状態も維持
-      validateNameAndPad();
-    }
-    window.addEventListener("gamepadconnected", refreshPadList);
-    window.addEventListener("gamepaddisconnected", refreshPadList);
-    document.getElementById("refreshPad").onclick = refreshPadList;
-    refreshPadList();
+document.getElementById('connectbtn').onclick = () => {
+  if (connected || connecting) {
+    disconnectCleanup();
+    return;
+  }
+  // 入力バリデーション
+  const username = document.getElementById('username').value.trim();
+  if (!username || username.length > 10) {
+    document.getElementById('nameerr').textContent = '10文字以内で入力';
+    return;
+  }
+  document.getElementById('nameerr').textContent = '';
+  setFormLock(true);
+  document.getElementById('connectbtn').textContent = '切断';
+  setStatus('接続中...');
+  connecting = true;
 
-    // wslURLとvdoID自動抽出＋iframe反映
-    function updateWSL() {
-      let raw = document.getElementById('wsl').value.trim();
-      wslURL = "";
-      vdoID = "";
-      // wsl用: https→wss、/ws追加
-      if (raw.startsWith("http")) {
-        try {
-          let u = new URL(raw);
-          wslURL = "wss://" + u.host + "/ws";
-          // vdo ninja view idはパス末尾または ?view= から抽出
-          vdoID = (u.searchParams.get("view")) || u.pathname.replace(/^\//, "");
-        } catch {}
-      }
-      // iframe更新
-      let vdo = document.getElementById("vdo-iframe");
-      if (vdoID) {
-        vdo.src = "https://vdo.ninja/?view=" + encodeURIComponent(vdoID) + "&nojitter";
-      } else {
-        vdo.src = "";
-      }
-    }
-    document.getElementById('wsl').addEventListener("input", updateWSL);
-
-    // 接続・切断トグル
-    document.getElementById('connectbtn').onclick = () => {
-      if (connected || connecting) {
-        // 切断
-        if (dataChannel && dataChannel.readyState === "open") dataChannel.close();
-        if (pc) try { pc.close(); } catch {}
-        if (ws && ws.readyState <= 1) try { ws.close(); } catch {}
-        connected = false; connecting = false;
-        setFormLock(false);
-        document.getElementById('connectbtn').textContent = '接続';
-        setStatus('切断しました');
-        updatePadIndicator(false);
-        refreshPadList();
-        document.getElementById("vdo-iframe").src = "";
-        return;
-      }
-      connecting = true;
-      setFormLock(true);
-      document.getElementById('connectbtn').textContent = '切断';
-      setStatus('コントローラー操作待ち...');
-      padIndex = parseInt(document.getElementById('padSelect').value);
-      watchPad();
-    };
-
-    function watchPad() {
-      let found = false;
-      function loop() {
-        const pads = navigator.getGamepads();
-        const pad = pads[padIndex];
-        if (pad) {
-          if (pad.buttons.some(btn => btn.pressed)) {
-            found = true;
-            startWS(pad);
-            return;
-          }
-        }
-        if (!found && !connected) requestAnimationFrame(loop);
-      }
-      loop();
-    }
-
-    function startWS(pad) {
-      const name = document.getElementById('uname').value.trim();
-      updateWSL();
-      if (!wslURL) {
-        setStatus("wslアドレスを入力してください");
-        setFormLock(false);
-        document.getElementById('connectbtn').textContent = '接続';
-        return;
-      }
-      ws = new WebSocket(wslURL); // シグナリング
-      ws.onopen = () => setStatus('シグナリングサーバー接続...');
-      ws.onmessage = async (ev) => {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === "ninja" && msg.url) {
-          document.getElementById('wsl').value = msg.url;
-          updateWSL();
-          return;
-        }
-        if (msg.type === "offer") {
-          pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-          pc.onicecandidate = e => {
-            if (e.candidate) {
-              ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate }));
-            }
-          };
-          pc.ondatachannel = e => {
-            dataChannel = e.channel;
-            dataChannel.binaryType = "arraybuffer";
-            dataChannel.onopen = () => {
-              connected = true;
-              setStatus('P2P接続完了！送信開始');
-              setFormLock(true);
-              document.getElementById('connectbtn').textContent = '切断';
-              ws.close();
-              dataChannel.send(JSON.stringify({ type: "hello", name: name, id: pad.id }));
-              startSending();
-            };
-            dataChannel.onclose = () => {
-              setStatus("切断しました");
-              connected = false;
-              connecting = false;
-              setFormLock(false);
-              document.getElementById('connectbtn').textContent = '接続';
-              updatePadIndicator(false);
-              refreshPadList();
-            };
-            dataChannel.onerror = () => setStatus("DataChannelエラー");
-            dataChannel.onmessage = ev => {  try {
-              const msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
-              if (msg.type === "ninja_id" && msg.id) {
-                document.getElementById("vdo-iframe").src = "https://vdo.ninja/?view=" + encodeURIComponent(msg.id) + "&nojitter";
-                return;
-              }
-            } catch {}};
-          };
-          await pc.setRemoteDescription(msg.offer);
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          ws.send(JSON.stringify({ type: "answer", answer }));
-        } else if (msg.type === "candidate" && pc) {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
-        } else if (msg.type === "error") {
-          setStatus("サーバーエラー: " + msg.reason);
-          connecting = false;
-          setFormLock(false);
-          document.getElementById('connectbtn').textContent = '接続';
-          try { ws.close(); } catch {}
-        }
+  ws = new WebSocket(document.getElementById('wsl-addr').value.trim());
+  ws.onclose = ws.onerror = () => { disconnectCleanup(); };
+  ws.onmessage = function(e) {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "offer") {
+      pc = new RTCPeerConnection();
+      pc.onicecandidate = e => {
+        if (e.candidate) ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate }));
       };
-      ws.onerror = () => setStatus("シグナリングエラー");
-      ws.onclose = () => setStatus("シグナリング切断");
+      pc.ondatachannel = ev => {
+        dataChannel = ev.channel;
+        dataChannel.onopen = () => {
+          connected = true;
+          connecting = false;
+          setStatus('接続完了');
+          setFormLock(true);
+          document.getElementById('connectbtn').textContent = '切断';
+          // hello送信
+          dataChannel.send(JSON.stringify({
+            type: "hello",
+            name: username,
+            id: Math.random().toString(36).slice(2,12)
+          }));
+        };
+        dataChannel.onclose = dataChannel.onerror = () => disconnectCleanup();
+        dataChannel.onmessage = ev => {
+          try {
+            const msg = JSON.parse(typeof ev.data === "string" ? ev.data : "");
+            if (msg.type === "ninja_id" && msg.id) {
+              document.getElementById("vdo-iframe").src = "https://vdo.ninja/?view=" + encodeURIComponent(msg.id) + "&nojitter";
+              return;
+            }
+            // サーバーからのdisconnectコマンドで安全に自動切断
+            if (msg.type === "disconnect") {
+              disconnectCleanup();
+              return;
+            }
+          } catch {}
+        };
+      };
+      pc.setRemoteDescription(msg.offer).then(() => {
+        return pc.createAnswer();
+      }).then(answer => {
+        return pc.setLocalDescription(answer);
+      }).then(() => {
+        ws.send(JSON.stringify({ type: "answer", answer: pc.localDescription }));
+      });
+    } else if (msg.type === "candidate") {
+      pc.addIceCandidate(new RTCIceCandidate(msg.candidate));
     }
+  };
+};
 
-    function encodeGamepadData(pad) {
-      let btnBits = 0;
-      for (let i = 0; i < 16; i++) {
-        if (pad.buttons[i]?.pressed) btnBits |= (1 << i);
-      }
-      const axes = [];
-      for (let i = 0; i < 4; i++) {
-        let v = Math.round((pad.axes[i] ?? 0) * 127.5 + 128);
-        v = Math.max(0, Math.min(255, v));
-        axes.push(v);
-      }
-      let lt = 0, rt = 0;
-      if (pad.buttons[6]) lt = Math.round((pad.buttons[6].value ?? 0) * 255);
-      else if (pad.axes[4] !== undefined) lt = Math.round(((pad.axes[4] + 1) / 2) * 255);
-      if (pad.buttons[7]) rt = Math.round((pad.buttons[7].value ?? 0) * 255);
-      else if (pad.axes[5] !== undefined) rt = Math.round(((pad.axes[5] + 1) / 2) * 255);
-      lt = Math.max(0, Math.min(255, lt));
-      rt = Math.max(0, Math.min(255, rt));
-      const buf = new Uint8Array(8);
-      buf[0] = btnBits & 0xFF;
-      buf[1] = (btnBits >> 8) & 0xFF;
-      buf[2] = axes[0] & 0xFF;
-      buf[3] = axes[1] & 0xFF;
-      buf[4] = axes[2] & 0xFF;
-      buf[5] = axes[3] & 0xFF;
-      buf[6] = lt & 0xFF;
-      buf[7] = rt & 0xFF;
-      return buf;
-    }
-    function isPadNeutral(pad) {
-      for (let i = 0; i < 16; i++) if (pad.buttons[i]?.pressed) return false;
-      const DEADZONE = 0.07;
-      for (let i = 0; i < 4; i++) if (Math.abs(pad.axes[i] ?? 0) > DEADZONE) return false;
-      if ((pad.buttons[6]?.value ?? 0) > 0.01) return false;
-      if ((pad.buttons[7]?.value ?? 0) > 0.01) return false;
-      return true;
-    }
-    function startSending() {
-      let prev = null;
-      function loop() {
-        const pad = navigator.getGamepads()[padIndex];
-        let active = false;
-        if (pad && dataChannel && dataChannel.readyState === "open") {
-          active = !isPadNeutral(pad);
-          const buf = encodeGamepadData(pad);
-          let diff = false;
-          if (!prev) diff = true;
-          else for (let i = 0; i < buf.length; i++) {
-            if (buf[i] !== prev[i]) { diff = true; break; }
-          }
-          if (diff) {
-            dataChannel.send(buf.buffer);
-            prev = buf;
-            setStatus('送信中:');
-          }
-        }
-        updatePadIndicator(active);
-        if (connected) requestAnimationFrame(loop);
-      }
-      loop();
-    }
-
-    // 初期化
-    updateWSL();
-
-  </script>
+function sendPadState() {
+  if (!connected || !dataChannel || dataChannel.readyState !== "open") {
+    updatePadIndicator(false);
+    return;
+  }
+  const pads = navigator.getGamepads();
+  const select = document.getElementById('gamepad-select');
+  const idx = Number(select.value);
+  const pad = pads && pads[idx];
+  if (!pad) {
+    updatePadIndicator(false);
+    return;
+  }
+  // Pad state (A/B/X/Y/L/R/Start/Dpad/Lx/Ly/Rx/Ry/LT/RT)
+  let btnBits = 0;
+  function b(i, n) { if (pad.buttons[i]?.pressed) btnBits |= (1 << n); }
+  b(0,0);b(1,1);b(2,2);b(3,3);b(4,4);b(5,5);b(8,8);b(9,9); //A,B,X,Y,L,R,Back,Start
+  // Dpad
+  b(12,12);b(13,13);b(14,14);b(15,15);
+  const lx = Math.round(((pad.axes[0] || 0) + 1) * 127.5);
+  const ly = Math.round((-(pad.axes[1] || 0) + 1) * 127.5);
+  const rx = Math.round(((pad.axes[2] || 0) + 1) * 127.5);
+  const ry = Math.round((-(pad.axes[3] || 0) + 1) * 127.5);
+  const lt = Math.round((pad.buttons[6]?.value || 0) * 255);
+  const rt = Math.round((pad.buttons[7]?.value || 0) * 255);
+  const buf = new Uint8Array([btnBits & 0xFF, btnBits >> 8, lx, ly, rx, ry, lt, rt]);
+  try {
+    dataChannel.send(buf);
+    // どれかボタン/スティックが押されていればindicator点灯
+    let active = !!btnBits || Math.abs(lx-128)>20 || Math.abs(ly-128)>20 || Math.abs(rx-128)>20 || Math.abs(ry-128)>20 || lt>10 || rt>10;
+    updatePadIndicator(active);
+  } catch(e){
+    updatePadIndicator(false);
+  }
+}
+setInterval(sendPadState, 50);
+</script>
 </body>
 </html>
