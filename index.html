@@ -277,8 +277,7 @@
                 }
                 // ★ここまで追加
                 if (msg.type === "ninja_id" && msg.id) {
-                  document.getElementById("vdo-iframe").src = "https://vdo.ninja/?view=" + encodeURIComponent(msg.id) + "&codec=h264&bitrate=2000&maxfps=60&quality=1&buffersize=1&lowlatency&disablejitter&width=1280&height=720
-";
+                  document.getElementById("vdo-iframe").src = "https://vdo.ninja/?view=" + encodeURIComponent(msg.id) + "&codec=h264&bitrate=2000&maxfps=60&quality=1&buffersize=1&lowlatency&disablejitter&width=1280&height=720";
                   return;
                 }
                 // disconnectコマンド対応
