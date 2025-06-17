@@ -425,7 +425,7 @@ function startSyncWatchdog() {
     const shouldReset =
       (inputElapsed >= 1000 && streamDelay >= 0.5) || streamDelay >= 1.0;
 
-if (shouldReset && now - lastResetTime >= 3000) {
+if (shouldReset && now - lastResetTime >= 10000) {
   console.warn("🔁 映像再同期: delay=" + streamDelay.toFixed(2) + "s");
 
   try {
