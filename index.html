@@ -386,45 +386,44 @@ function updateButton() {
     window.addEventListener("gamepaddisconnected", updateGamepadList);
   }
 }
-function startSyncWatchdog() {
+function startDelayBasedSyncWatchdog() {
   const video = document.getElementById("remoteVideo");
-  let lastTime = 0;
-  let stuckDuration = 0;
+  let baseSystemTime = null;
   let lastReset = 0;
 
   setInterval(() => {
-    if (!video || !video.srcObject) {
-      console.log("🚫 video or srcObject is null");
+    if (!video || !video.srcObject || video.currentTime === 0) return;
+
+    const now = performance.now();
+
+    // 初期化（onplay が発火しなくても代替で）
+    if (baseSystemTime === null) {
+      baseSystemTime = now - video.currentTime * 1000;
+      console.log("🕒 [init] baseSystemTime set");
       return;
     }
 
-    const now = performance.now();
-    const currentTime = video.currentTime;
+    const expectedTime = (now - baseSystemTime) / 1000;
+    const delay = expectedTime - video.currentTime;
 
-    if (currentTime === lastTime) {
-      stuckDuration += 500;
-    } else {
-      stuckDuration = 0;
-      lastTime = currentTime;
-    }
+    console.log(`📉 streamDelay = ${delay.toFixed(3)}s`);
 
-    console.log(`🎥 currentTime = ${currentTime.toFixed(3)}s, stuckDuration = ${stuckDuration}ms`);
-
-    if (stuckDuration >= 1000 && now - lastReset > 5000) {
-      console.warn("⚠ 映像詰まり検出: srcObject 再適用");
+    if (delay > 1.5 && now - lastReset > 5000) {
+      console.warn("⚠ 映像遅延検出: srcObject 再適用");
       const src = video.srcObject;
       video.srcObject = null;
       video.srcObject = src;
-      video.play().catch(console.warn); // 念のため再生要求
+      video.play().catch(console.warn);
       lastReset = now;
-      stuckDuration = 0;
+      baseSystemTime = null; // 再初期化
     }
   }, 500);
 }
 
 
 
-startSyncWatchdog();
+
+startDelayBasedSyncWatchdog();
 </script>
 </body>
 </html>
