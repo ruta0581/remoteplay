@@ -430,7 +430,30 @@ function updateButton() {
     window.addEventListener("gamepaddisconnected", updateGamepadList);
   }
 }
+// 既存の video 取得の直後
 const video = document.getElementById("remoteVideo");
+
+// --- ここから監視追加 ---
+let videoStuckTimeout = null;
+function monitorVideoStuck() {
+  let lastTime = video.currentTime;
+  clearTimeout(videoStuckTimeout);
+  videoStuckTimeout = setTimeout(() => {
+    // 4秒間currentTimeが進んでいない、またはreadyState<2
+    if (video.currentTime === lastTime || video.readyState < 2) {
+      console.warn("⚠️ 映像が停止 or 未受信。自動再同期");
+      // 軽い再同期（基準値クリアでwatchdogが自動再同期判断）
+      videoStartTimestamp = null;
+      videoStartPerfTime = null;
+      // 必要に応じてもっと強い復帰（例：再接続）
+      // toggleConnection();
+    }
+    monitorVideoStuck(); // ループ継続
+  }, 4000);
+}
+video.addEventListener("play", monitorVideoStuck);
+// --- ここまで ---
+
 
 video.addEventListener("play", () => {
   if (!syncIntervalId) startSyncWatchdog();
