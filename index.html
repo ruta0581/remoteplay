@@ -66,9 +66,21 @@ function createPeerConnection() {
   };
 newPc.ondatachannel = (event) => {
   dataChannel = event.channel;
-  dataChannel.binaryType = "arraybuffer"; // ★ 追加！
+  dataChannel.binaryType = "arraybuffer";
+
+  let dataChannelOpened = false;
+  const openTimeout = setTimeout(() => {
+    if (!dataChannelOpened) {
+      console.warn("⚠️ DataChannelが開かないため再接続します");
+      reconnect();
+    }
+  }, 5000); // 5秒以内にopenしなければ再接続
 
   dataChannel.onopen = () => {
+    clearTimeout(openTimeout);
+    dataChannelOpened = true;
+
+    console.log("✅ DataChannel Open");
     dcKeepAliveInterval = setInterval(() => {
       if (dataChannel.readyState === "open") {
         dataChannel.send(new Uint8Array([0]));
@@ -76,27 +88,28 @@ newPc.ondatachannel = (event) => {
     }, 5000);
     startGamepadPolling();
   };
+
   dataChannel.onclose = () => {
     if (dcKeepAliveInterval) clearInterval(dcKeepAliveInterval);
     dcKeepAliveInterval = null;
   };
+
   dataChannel.onmessage = (e) => {
-  const buf = new Uint8Array(e.data);
-  if (buf.length === 1 && buf[0] === 0) return; // keepalive
+    const buf = new Uint8Array(e.data);
+    if (buf.length === 1 && buf[0] === 0) return;
 
-  // 🎦 type=1 → 映像タイムスタンプ
-  if (buf[0] === 1 && buf.length === 5) {
-    const serverTimestampSec =
-      buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
-    const video = document.getElementById("remoteVideo");
-    const streamTime = video?.currentTime ?? 0;
-    const clientNowSec = Math.floor(Date.now() / 1000);
-    const delaySec = clientNowSec - serverTimestampSec;
-    console.log(`🎥 streamTime=${streamTime.toFixed(3)}s 📡 delay=${delaySec}s`);
-  }
+    if (buf[0] === 1 && buf.length === 5) {
+      const serverTimestampSec =
+        buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
+      const video = document.getElementById("remoteVideo");
+      const streamTime = video?.currentTime ?? 0;
+      const clientNowSec = Math.floor(Date.now() / 1000);
+      const delaySec = clientNowSec - serverTimestampSec;
+      console.log(`🎥 streamTime=${streamTime.toFixed(3)}s 📡 delay=${delaySec}s`);
+    }
+  };
 };
 
-};
 
   return newPc;
 }
