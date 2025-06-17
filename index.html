@@ -395,15 +395,25 @@ function startSyncWatchdog() {
   let baseSystemTime = null;
   let lastResetTime = 0;
 
-  video.onplay = () => {
-    baseSystemTime = performance.now() - video.currentTime * 1000;
-    console.log("🕒 baseSystemTime calibrated");
-  };
-
-  setInterval(() => {
-    if (!video || !video.srcObject || baseSystemTime === null) return;
+  const syncInterval = setInterval(() => {
+    if (!video || !video.srcObject) {
+      console.log("🚫 no video or stream");
+      return;
+    }
 
     const now = performance.now();
+
+    // 回線が重くて onplay が発火しなくても強制初期化
+    if (baseSystemTime === null && video.currentTime > 0) {
+      baseSystemTime = now - video.currentTime * 1000;
+      console.log("🕒 [auto] baseSystemTime initialized");
+    }
+
+    if (baseSystemTime === null) {
+      console.log("⏳ waiting for baseSystemTime...");
+      return;
+    }
+
     const inputElapsed = now - lastInputTime;
 
     const currentVideoTime = video.currentTime;
@@ -415,38 +425,36 @@ function startSyncWatchdog() {
     lastVideoTime = currentVideoTime;
 
     const streamDelayRaw = (now - baseSystemTime) / 1000 - currentVideoTime;
-
-    // マイナス補正（再同期直後など）
     if (streamDelayRaw < -0.5) return;
-    const streamDelay = Math.max(0, streamDelayRaw);
 
+    const streamDelay = Math.max(0, streamDelayRaw);
     console.log("📊 streamDelay =", streamDelay.toFixed(3), "sec");
 
     const shouldReset =
-      (inputElapsed >= 1000 && streamDelay >= 0.5) || streamDelay >= 1.0;
+      (sameInputDuration >= 1000 && streamDelay >= 0.3) ||
+      (streamDelay >= 1.0);
 
-if (shouldReset && now - lastResetTime >= 10000) {
-  console.warn("🔁 映像再同期: delay=" + streamDelay.toFixed(2) + "s");
+    if (shouldReset && now - lastResetTime >= 10000) {
+      console.warn("🔁 映像再同期: delay=" + streamDelay.toFixed(2) + "s");
 
-  try {
-    video.pause(); // 明示停止
-    video.currentTime = video.currentTime; // 強制的にリシーク（再描画促進）
-    video.play().catch(e => console.warn("再生再試行失敗:", e));
-  } catch (e) {
-    console.warn("再生再同期失敗:", e);
-  }
+      try {
+        video.style.visibility = "hidden";
+        const stream = video.srcObject;
+        video.srcObject = null;
+        video.srcObject = stream;
+        setTimeout(() => {
+          video.style.visibility = "visible";
+        }, 100);
+      } catch (e) {
+        console.warn("再同期失敗:", e);
+      }
 
-  lastResetTime = now;
-  lastVideoTime = 0;
-  sameInputDuration = 0;
-}
-
-
+      lastResetTime = now;
+      lastVideoTime = 0;
+      sameInputDuration = 0;
+    }
   }, 500);
 }
-
-
-
 
 </script>
 </body>
