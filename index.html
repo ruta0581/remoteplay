@@ -50,8 +50,6 @@ let pc = null, ws = null, clientId = null;
 let dataChannel = null, dcKeepAliveInterval = null;
 let wsPingInterval = null;
 let connected = false;
-let lastVideoTimestamp = 0;
-let lastReceivedTime = 0;
 
 function createPeerConnection() {
   const newPc = new RTCPeerConnection({
@@ -82,22 +80,21 @@ newPc.ondatachannel = (event) => {
     if (dcKeepAliveInterval) clearInterval(dcKeepAliveInterval);
     dcKeepAliveInterval = null;
   };
-dataChannel.onmessage = (e) => {
+  dataChannel.onmessage = (e) => {
   const buf = new Uint8Array(e.data);
   if (buf.length === 1 && buf[0] === 0) return; // keepalive
 
+  // 🎦 type=1 → 映像タイムスタンプ
   if (buf[0] === 1 && buf.length === 5) {
-    // type 1 = 映像タイムスタンプ（秒単位）
-    const ts =
-      (buf[1] |
-       (buf[2] << 8) |
-       (buf[3] << 16) |
-       (buf[4] << 24)) >>> 0; // ← ★ ここが重要！
-
-    receiveServerTimestamp(ts * 1000); // ms に変換
+    const serverTimestampSec =
+      buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
+    const video = document.getElementById("remoteVideo");
+    const streamTime = video?.currentTime ?? 0;
+    const clientNowSec = Math.floor(Date.now() / 1000);
+    const delaySec = clientNowSec - serverTimestampSec;
+    console.log(`🎥 streamTime=${streamTime.toFixed(3)}s 📡 delay=${delaySec}s`);
   }
 };
-
 
 };
 
@@ -404,40 +401,7 @@ function updateButton() {
     window.addEventListener("gamepaddisconnected", updateGamepadList);
   }
 }
-function receiveServerTimestamp(tsMillis) {
-  lastVideoTimestamp = tsMillis;
-  lastReceivedTime = performance.now();
-}
 
-function startAccurateDelayWatchdog() {
-  const video = document.getElementById("remoteVideo");
-  let lastReset = 0;
-
-  setInterval(() => {
-    if (!video || !video.srcObject || video.currentTime === 0 || lastVideoTimestamp === 0) return;
-
-    const now = performance.now();
-    const elapsed = now - lastReceivedTime;
-    const estimatedNowTimestamp = lastVideoTimestamp + elapsed;
-
-    const currentPlaybackTimestamp = video.currentTime * 1000;
-    const delay = (estimatedNowTimestamp - currentPlaybackTimestamp) / 1000;
-
-    console.log(`📉 accurateStreamDelay = ${delay.toFixed(3)}s`);
-
-    if (delay > 1.5 && now - lastReset > 5000) {
-      console.warn("⚠ accurate映像遅延検出 → srcObject 再適用");
-      const src = video.srcObject;
-      video.srcObject = null;
-      video.srcObject = src;
-      video.play().catch(console.warn);
-      lastReset = now;
-    }
-  }, 500);
-}
-
-
-startAccurateDelayWatchdog();
 </script>
 </body>
 </html>
