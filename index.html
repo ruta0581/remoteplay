@@ -55,15 +55,20 @@ let lastVideoTimestamp = null;     // サーバーから受信した映像送信
 let videoStartTimestamp = null;    // 映像再生開始時のサーバー時刻（秒）
 let videoStartPerfTime = null;     // 映像再生開始時のクライアント時刻（performance.now）
 let syncIntervalId = null;
+let isResetting = false;
 
 function createPeerConnection() {
   const newPc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
   });
 
-  newPc.ontrack = e => {
-    document.getElementById("remoteVideo").srcObject = e.streams[0];
-  };
+newPc.ontrack = e => {
+  document.getElementById("remoteVideo").srcObject = e.streams[0];
+  videoStartTimestamp = null;
+  videoStartPerfTime = null;
+  lastVideoTimestamp = null;
+  // clockOffsetは残してOK
+};
 
   newPc.ondatachannel = (event) => {
     dataChannel = event.channel;
@@ -82,27 +87,24 @@ function createPeerConnection() {
 
 dataChannel.onmessage = (e) => {
   const buf = new Uint8Array(e.data);
-  if (buf.length === 1 && buf[0] === 0) return; // keepalive
-
+  if (buf.length === 1 && buf[0] === 0) return;
   if (buf[0] === 1 && buf.length === 5) {
     const ts = buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
     lastVideoTimestamp = ts;
-
-    // 再生中で、まだvideoStartTimestampがセットされてなければここでセット
-if (
-  videoStartTimestamp === null &&
-  video &&
-  !video.paused &&
-  video.readyState >= 2
-) {
-  videoStartTimestamp = lastVideoTimestamp;
-  videoStartPerfTime = performance.now();
-  console.log("▶️ (onmessage側) 再生開始基準: serverTS =", videoStartTimestamp, " perf.now =", videoStartPerfTime);
-
-  if (!syncIntervalId) {
-    startSyncWatchdog();  // ★ ここでも保証
-  }
-}
+    if (clockOffset === null) {
+      clockOffset = (Date.now() / 1000) - ts;
+    }
+    if (
+      videoStartTimestamp === null &&
+      video &&
+      !video.paused &&
+      video.readyState >= 2
+    ) {
+      videoStartTimestamp = lastVideoTimestamp;
+      videoStartPerfTime = performance.now();
+      //console.log("基準セット ts=", videoStartTimestamp);
+      if (!syncIntervalId) startSyncWatchdog();
+    }
   }
 };
 
@@ -431,87 +433,51 @@ function updateButton() {
 const video = document.getElementById("remoteVideo");
 
 video.addEventListener("play", () => {
-  if (lastVideoTimestamp !== null && videoStartTimestamp === null) {
-    videoStartTimestamp = lastVideoTimestamp;
-    videoStartPerfTime = performance.now();
-    console.log("▶️ 再生開始基準: serverTS =", videoStartTimestamp, " perf.now =", videoStartPerfTime);
-  }
-
-  // 強制的に startSyncWatchdog をここでも再開
-  if (!syncIntervalId) {
-    startSyncWatchdog();
-  }
+  if (!syncIntervalId) startSyncWatchdog();
 });
 
+let clockOffset = null; // サーバークライアント間の時計差
+
 function startSyncWatchdog() {
-  // すでにintervalが動いていれば止める
-  if (syncIntervalId) {
-    clearInterval(syncIntervalId);
-    syncIntervalId = null;
-  }
-
-  let lastVideoTime = 0;
-  let sameInputDuration = 0;
+  if (syncIntervalId) clearInterval(syncIntervalId);
   let lastResetTime = 0;
-
   syncIntervalId = setInterval(() => {
-    if (!video || !video.srcObject) {
-      // ...
-      return;
-    }
-
+    if (!video || !video.srcObject) return;
     const now = performance.now();
-    const currentVideoTime = video.currentTime;
+    const inputElapsed = now - lastInputTime;
+    if (videoStartTimestamp === null || videoStartPerfTime === null || clockOffset === null) return;
 
-    if (currentVideoTime === lastVideoTime) {
-      sameInputDuration += 500;
-    } else {
-      sameInputDuration = 0;
+    const elapsed = (now - videoStartPerfTime) / 1000;
+    const expectedServerNow = videoStartTimestamp + elapsed;
+    const actualServerNow = (Date.now() / 1000) - clockOffset;
+    const rawDelay = actualServerNow - expectedServerNow;
+    if (Math.abs(rawDelay) > 5) return; // 極端な値は無視
+
+    const streamDelay = Math.max(0, rawDelay);
+    console.log("📊 streamDelay =", streamDelay.toFixed(3));
+
+    const shouldReset =
+      (inputElapsed >= 1000 && streamDelay >= 0.5) ||
+      (streamDelay >= 1.0);
+
+    if (shouldReset && now - lastResetTime >= 10000 && !isResetting) {
+      isResetting = true;
+      try {
+        const currentTime = video.currentTime;
+        video.pause();
+        video.currentTime = Math.max(0, currentTime - 0.1);
+        video.addEventListener("seeked", () => {
+          video.play();
+          // ここで再度基準をクリア
+          videoStartTimestamp = null;
+          videoStartPerfTime = null;
+          lastResetTime = performance.now();
+          isResetting = false;
+        }, { once: true });
+      } catch (e) { isResetting = false; }
     }
-    lastVideoTime = currentVideoTime;
-
-    if (videoStartTimestamp !== null && videoStartPerfTime !== null) {
-      const elapsed = (performance.now() - videoStartPerfTime) / 1000;
-      const expectedServerNow = videoStartTimestamp + elapsed;
-      const actualServerNow = Date.now() / 1000;
-
-      const rawDelay = actualServerNow - expectedServerNow;
-      const streamDelay = Math.max(0, rawDelay);
-
-      console.log("📊 再生基準 streamDelay =", streamDelay.toFixed(3), "sec");
-
-      const shouldReset =
-        (sameInputDuration >= 1000 && streamDelay >= 0.5) ||
-        (streamDelay >= 1.0);
-
-      if (shouldReset && now - lastResetTime >= 10000) {
-        console.warn("🔁 映像再同期: delay=" + streamDelay.toFixed(2) + "s");
-        try {
-          video.style.visibility = "hidden";
-          const stream = video.srcObject;
-          video.srcObject = null;
-          video.srcObject = stream;
-          setTimeout(() => {
-            video.style.visibility = "visible";
-          }, 100);
-        } catch (e) {
-          console.warn("再同期失敗:", e);
-        }
-
-        lastResetTime = now;
-        lastVideoTime = 0;
-        sameInputDuration = 0;
-        videoStartTimestamp = null;
-        videoStartPerfTime = null;
-        // ★ intervalもリセット
-        clearInterval(syncIntervalId);
-        syncIntervalId = null;
-      }
-    }
-  }, 500); // ← ここの前のカンマの前は1個だけ }
+  }, 500);
 }
-
-
 </script>
 </body>
 </html>
