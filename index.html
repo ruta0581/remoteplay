@@ -50,66 +50,38 @@ let pc = null, ws = null, clientId = null;
 let dataChannel = null, dcKeepAliveInterval = null;
 let wsPingInterval = null;
 let connected = false;
-let lastInputTime = performance.now();
-let lastVideoTimestamp = null;     // サーバーから受信した映像送信時刻（秒）
-let videoStartTimestamp = null;    // 映像再生開始時のサーバー時刻（秒）
-let videoStartPerfTime = null;     // 映像再生開始時のクライアント時刻（performance.now）
-let syncIntervalId = null;
-let isResetting = false;
 
 function createPeerConnection() {
   const newPc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
   });
 
-newPc.ontrack = e => {
-  document.getElementById("remoteVideo").srcObject = e.streams[0];
-  videoStartTimestamp = null;
-  videoStartPerfTime = null;
-  lastVideoTimestamp = null;
-  // clockOffsetは残してOK
-};
-
-  newPc.ondatachannel = (event) => {
-    dataChannel = event.channel;
-    dataChannel.binaryType = "arraybuffer";
-
-    dataChannel.onopen = () => {
-      lastInputTime = performance.now();
-      dcKeepAliveInterval = setInterval(() => {
-        if (dataChannel.readyState === "open") {
-          dataChannel.send(new Uint8Array([0]));
-        }
-      }, 5000);
-      startGamepadPolling();
-      startSyncWatchdog();
-    };
-
-dataChannel.onmessage = (e) => {
-  const buf = new Uint8Array(e.data);
-  if (buf.length === 1 && buf[0] === 0) return;
-  if (buf[0] === 1 && buf.length === 5) {
-    const ts = buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
-    lastVideoTimestamp = ts;
-    if (clockOffset === null) {
-      clockOffset = (Date.now() / 1000) - ts;
-    }
-    if (
-      videoStartTimestamp === null &&
-      video &&
-      !video.paused &&
-      video.readyState >= 2
-    ) {
-      videoStartTimestamp = lastVideoTimestamp;
-      videoStartPerfTime = performance.now();
-      //console.log("基準セット ts=", videoStartTimestamp);
-      if (!syncIntervalId) startSyncWatchdog();
-    }
-  }
-};
-
-
+  newPc.ontrack = e => {
+    document.getElementById("remoteVideo").srcObject = e.streams[0];
   };
+  newPc.onicecandidate = e => {
+    if (e.candidate && clientId !== null && ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, clientId }));
+    }
+  };
+newPc.ondatachannel = (event) => {
+  dataChannel = event.channel;
+  dataChannel.binaryType = "arraybuffer"; // ★ 追加！
+
+  dataChannel.onopen = () => {
+    dcKeepAliveInterval = setInterval(() => {
+      if (dataChannel.readyState === "open") {
+        dataChannel.send(new Uint8Array([0]));
+      }
+    }, 5000);
+    startGamepadPolling();
+  };
+  dataChannel.onclose = () => {
+    if (dcKeepAliveInterval) clearInterval(dcKeepAliveInterval);
+    dcKeepAliveInterval = null;
+  };
+  dataChannel.onmessage = (e) => {};
+};
 
   return newPc;
 }
@@ -126,15 +98,7 @@ function closePeerConnection() {
     clearInterval(dcKeepAliveInterval);
     dcKeepAliveInterval = null;
   }
-  // ★ ここで基準もリセット
-  videoStartTimestamp = null;
-  videoStartPerfTime = null;
-  if (syncIntervalId) {
-    clearInterval(syncIntervalId);
-    syncIntervalId = null;
-  }
 }
-
 
 function connect() {
   const url = document.getElementById("wssUrl").value;
@@ -264,19 +228,10 @@ function toggleConnection() {
     document.getElementById("remoteVideo").srcObject = null;
     connected = false;
     updateButton();
-    videoStartTimestamp = null;
-    videoStartPerfTime = null;
-    // ★
-    if (syncIntervalId) {
-      clearInterval(syncIntervalId);
-      syncIntervalId = null;
-    }
   } else {
     connect();
   }
 }
-
-
 
 // 映像クリックで停止しないように
 const remoteVideo = document.getElementById("remoteVideo");
@@ -289,6 +244,7 @@ remoteVideo.addEventListener('pause', (e) => {
 function startGamepadPolling() {
   let lastButtonStates = [];
   let lastAxes = [];
+  let lastInputTime = 0;
   const indicator = document.getElementById("inputIndicator");
 
   function updateIndicator() {
@@ -430,77 +386,45 @@ function updateButton() {
     window.addEventListener("gamepaddisconnected", updateGamepadList);
   }
 }
-// 既存の video 取得の直後
-const video = document.getElementById("remoteVideo");
-
-// --- ここから監視追加 ---
-let videoStuckTimeout = null;
-function monitorVideoStuck() {
-  let lastTime = video.currentTime;
-  clearTimeout(videoStuckTimeout);
-  videoStuckTimeout = setTimeout(() => {
-    // 4秒間currentTimeが進んでいない、またはreadyState<2
-    if (video.currentTime === lastTime || video.readyState < 2) {
-      console.warn("⚠️ 映像が停止 or 未受信。自動再同期");
-      // 軽い再同期（基準値クリアでwatchdogが自動再同期判断）
-      videoStartTimestamp = null;
-      videoStartPerfTime = null;
-      // 必要に応じてもっと強い復帰（例：再接続）
-      // toggleConnection();
-    }
-    monitorVideoStuck(); // ループ継続
-  }, 4000);
-}
-video.addEventListener("play", monitorVideoStuck);
-// --- ここまで ---
-
-
-video.addEventListener("play", () => {
-  if (!syncIntervalId) startSyncWatchdog();
-});
-
-let clockOffset = null; // サーバークライアント間の時計差
-
 function startSyncWatchdog() {
-  if (syncIntervalId) clearInterval(syncIntervalId);
-  let lastResetTime = 0;
-  syncIntervalId = setInterval(() => {
-    if (!video || !video.srcObject) return;
+  const video = document.getElementById("remoteVideo");
+  let lastTime = 0;
+  let stuckDuration = 0;
+  let lastReset = 0;
+
+  setInterval(() => {
+    if (!video || !video.srcObject) {
+      console.log("🚫 video or srcObject is null");
+      return;
+    }
+
     const now = performance.now();
-    const inputElapsed = now - lastInputTime;
-    if (videoStartTimestamp === null || videoStartPerfTime === null || clockOffset === null) return;
+    const currentTime = video.currentTime;
 
-    const elapsed = (now - videoStartPerfTime) / 1000;
-    const expectedServerNow = videoStartTimestamp + elapsed;
-    const actualServerNow = (Date.now() / 1000) - clockOffset;
-    const rawDelay = actualServerNow - expectedServerNow;
-    if (Math.abs(rawDelay) > 5) return; // 極端な値は無視
+    if (currentTime === lastTime) {
+      stuckDuration += 500;
+    } else {
+      stuckDuration = 0;
+      lastTime = currentTime;
+    }
 
-    const streamDelay = Math.max(0, rawDelay);
-    console.log("📊 streamDelay =", streamDelay.toFixed(3));
+    console.log(`🎥 currentTime = ${currentTime.toFixed(3)}s, stuckDuration = ${stuckDuration}ms`);
 
-    const shouldReset =
-      (inputElapsed >= 1000 && streamDelay >= 0.5) ||
-      (streamDelay >= 1.0);
-
-    if (shouldReset && now - lastResetTime >= 10000 && !isResetting) {
-      isResetting = true;
-      try {
-        const currentTime = video.currentTime;
-        video.pause();
-        video.currentTime = Math.max(0, currentTime - 0.1);
-        video.addEventListener("seeked", () => {
-          video.play();
-          // ここで再度基準をクリア
-          videoStartTimestamp = null;
-          videoStartPerfTime = null;
-          lastResetTime = performance.now();
-          isResetting = false;
-        }, { once: true });
-      } catch (e) { isResetting = false; }
+    if (stuckDuration >= 1000 && now - lastReset > 5000) {
+      console.warn("⚠ 映像詰まり検出: srcObject 再適用");
+      const src = video.srcObject;
+      video.srcObject = null;
+      video.srcObject = src;
+      video.play().catch(console.warn); // 念のため再生要求
+      lastReset = now;
+      stuckDuration = 0;
     }
   }, 500);
 }
+
+
+
+startSyncWatchdog();
 </script>
 </body>
 </html>
