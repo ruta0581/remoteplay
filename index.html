@@ -94,20 +94,36 @@ newPc.ondatachannel = (event) => {
     dcKeepAliveInterval = null;
   };
 
-  dataChannel.onmessage = (e) => {
-    const buf = new Uint8Array(e.data);
-    if (buf.length === 1 && buf[0] === 0) return;
+let lastValidTimestamp = 0;
 
-    if (buf[0] === 1 && buf.length === 5) {
-      const serverTimestampSec =
-        buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
-      const video = document.getElementById("remoteVideo");
-      const streamTime = video?.currentTime ?? 0;
-      const clientNowSec = Math.floor(Date.now() / 1000);
-      const delaySec = clientNowSec - serverTimestampSec;
-      console.log(`🎥 streamTime=${streamTime.toFixed(3)}s 📡 delay=${delaySec}s`);
+dataChannel.onmessage = (e) => {
+  const buf = new Uint8Array(e.data);
+  if (buf.length === 1 && buf[0] === 0) return;
+
+  if (buf[0] === 1 && buf.length === 5) {
+    const ts =
+      buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
+    const now = Date.now();
+    
+    // サーバーも Date.now() の下位32bit を送っている前提
+    const nowLow = now >>> 0;
+    const delta = (nowLow - ts + 0x100000000) % 0x100000000; // 32bitオーバーフロー補正
+
+    // 無効値除外（±30秒以上ずれてるものは捨てる）
+    if (delta > 30000) {
+      console.warn("⚠️ 無効な映像timestamp破棄:", ts, "nowLow=", nowLow);
+      return;
     }
-  };
+
+    const video = document.getElementById("remoteVideo");
+    const streamTime = video?.currentTime ?? 0;
+    console.log(`🎥 streamTime=${streamTime.toFixed(3)}s ⏱️ accurateStreamDelay = ${delta}ms`);
+
+    lastValidTimestamp = ts;
+  }
+};
+
+
 };
 
 
@@ -173,6 +189,13 @@ ws.onopen = () => {
 
 ws.onmessage = async ({ data }) => {
   const msg = JSON.parse(data);
+
+  if (msg.type === "video-ts" && typeof msg.timestamp === "number") {
+    const now = Date.now();
+    const delay = now - msg.timestamp;
+    const streamTime = document.getElementById("remoteVideo")?.currentTime ?? 0;
+    console.log(`🎥 streamTime=${streamTime.toFixed(3)}s 🧭 WS delay = ${delay}ms`);
+  }
 
   if (msg.type === "pong") return;
 
