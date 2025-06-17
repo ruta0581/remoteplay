@@ -50,6 +50,7 @@ let pc = null, ws = null, clientId = null;
 let dataChannel = null, dcKeepAliveInterval = null;
 let wsPingInterval = null;
 let connected = false;
+let lastInputTime = performance.now();
 
 function createPeerConnection() {
   const newPc = new RTCPeerConnection({
@@ -64,22 +65,27 @@ function createPeerConnection() {
       ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, clientId }));
     }
   };
-  newPc.ondatachannel = (event) => {
-    dataChannel = event.channel;
-dataChannel.onopen = () => {
-  dcKeepAliveInterval = setInterval(() => {
-    if (dataChannel.readyState === "open") {
-      dataChannel.send("keepalive");
-    }
-  }, 5000);
-  startGamepadPolling(); // ← これを追加！
-};
-    dataChannel.onclose = () => {
-      if (dcKeepAliveInterval) clearInterval(dcKeepAliveInterval);
-      dcKeepAliveInterval = null;
-    };
-    dataChannel.onmessage = (e) => {};
+newPc.ondatachannel = (event) => {
+  dataChannel = event.channel;
+  dataChannel.binaryType = "arraybuffer"; // ★ 追加！
+
+  dataChannel.onopen = () => {
+  lastInputTime = performance.now();
+    dcKeepAliveInterval = setInterval(() => {
+      if (dataChannel.readyState === "open") {
+        dataChannel.send(new Uint8Array([0]));
+      }
+    }, 5000);
+    startGamepadPolling();
+	startSyncWatchdog(); 
   };
+  dataChannel.onclose = () => {
+    if (dcKeepAliveInterval) clearInterval(dcKeepAliveInterval);
+    dcKeepAliveInterval = null;
+  };
+  dataChannel.onmessage = (e) => {};
+};
+
   return newPc;
 }
 
@@ -241,7 +247,6 @@ remoteVideo.addEventListener('pause', (e) => {
 function startGamepadPolling() {
   let lastButtonStates = [];
   let lastAxes = [];
-  let lastInputTime = 0;
   const indicator = document.getElementById("inputIndicator");
 
   function updateIndicator() {
@@ -290,20 +295,36 @@ function startGamepadPolling() {
                             buttons.some((v, i) => v !== lastButtonStates[i]);
       const axesChanged = lastAxes.length !== axesCombined.length ||
                           axesCombined.some((v, i) => v !== lastAxes[i]);
+if (buttonChanged || axesChanged) {
+  lastInputTime = performance.now();
 
-      if (buttonChanged || axesChanged) {
-        lastInputTime = performance.now();
-        const payload = {
-          type: "gamepad",
-          buttons,
-          axes: axesCombined,
-          timestamp: Date.now()
-        };
-        //console.log("[送信]", payload);
-        dataChannel.send(JSON.stringify(payload));
-        lastButtonStates = buttons;
-        lastAxes = axesCombined;
-      }
+  // バイナリ構造: [0][14ボタン][6軸][タイムスタンプ: 4byte(ms)]
+  const buffer = new Uint8Array(1 + 14 + 6 + 4);
+  buffer[0] = 0; // type = 0 = gamepad
+
+  // buttons (14 x 1byte)
+  for (let i = 0; i < 14; i++) {
+    buffer[1 + i] = buttons[i];
+  }
+
+  // axes (6 x 1byte)
+  for (let i = 0; i < 6; i++) {
+    buffer[15 + i] = axesCombined[i];
+  }
+
+  // timestamp (uint32, little-endian)
+  const ts = Date.now();
+  buffer[21] = ts & 0xFF;
+  buffer[22] = (ts >> 8) & 0xFF;
+  buffer[23] = (ts >> 16) & 0xFF;
+  buffer[24] = (ts >> 24) & 0xFF;
+
+  dataChannel.send(buffer);
+
+  lastButtonStates = buttons;
+  lastAxes = axesCombined;
+}
+
     }
     updateIndicator();
     requestAnimationFrame(poll);
@@ -367,6 +388,65 @@ function updateButton() {
     window.addEventListener("gamepaddisconnected", updateGamepadList);
   }
 }
+function startSyncWatchdog() {
+  const video = document.getElementById("remoteVideo");
+  let lastVideoTime = 0;
+  let sameInputDuration = 0;
+  let baseSystemTime = null;
+  let lastResetTime = 0;
+
+  video.onplay = () => {
+    baseSystemTime = performance.now() - video.currentTime * 1000;
+    console.log("🕒 baseSystemTime calibrated");
+  };
+
+  setInterval(() => {
+    if (!video || !video.srcObject || baseSystemTime === null) return;
+
+    const now = performance.now();
+    const inputElapsed = now - lastInputTime;
+
+    const currentVideoTime = video.currentTime;
+    if (currentVideoTime === lastVideoTime) {
+      sameInputDuration += 500;
+    } else {
+      sameInputDuration = 0;
+    }
+    lastVideoTime = currentVideoTime;
+
+    const streamDelayRaw = (now - baseSystemTime) / 1000 - currentVideoTime;
+
+    // マイナス補正（再同期直後など）
+    if (streamDelayRaw < -0.5) return;
+    const streamDelay = Math.max(0, streamDelayRaw);
+
+    console.log("📊 streamDelay =", streamDelay.toFixed(3), "sec");
+
+    const shouldReset =
+      (inputElapsed >= 1000 && streamDelay >= 0.5) || streamDelay >= 1.0;
+
+if (shouldReset && now - lastResetTime >= 3000) {
+  console.warn("🔁 映像再同期: delay=" + streamDelay.toFixed(2) + "s");
+
+  try {
+    video.pause(); // 明示停止
+    video.currentTime = video.currentTime; // 強制的にリシーク（再描画促進）
+    video.play().catch(e => console.warn("再生再試行失敗:", e));
+  } catch (e) {
+    console.warn("再生再同期失敗:", e);
+  }
+
+  lastResetTime = now;
+  lastVideoTime = 0;
+  sameInputDuration = 0;
+}
+
+
+  }, 500);
+}
+
+
+
 
 </script>
 </body>
