@@ -51,6 +51,10 @@ let dataChannel = null, dcKeepAliveInterval = null;
 let wsPingInterval = null;
 let connected = false;
 let lastInputTime = performance.now();
+let lastVideoTimestamp = null;     // サーバーから受信した映像送信時刻（秒）
+let videoStartTimestamp = null;    // 映像再生開始時のサーバー時刻（秒）
+let videoStartPerfTime = null;     // 映像再生開始時のクライアント時刻（performance.now）
+let syncIntervalId = null;
 
 function createPeerConnection() {
   const newPc = new RTCPeerConnection({
@@ -60,31 +64,50 @@ function createPeerConnection() {
   newPc.ontrack = e => {
     document.getElementById("remoteVideo").srcObject = e.streams[0];
   };
-  newPc.onicecandidate = e => {
-    if (e.candidate && clientId !== null && ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "candidate", candidate: e.candidate, clientId }));
-    }
-  };
-newPc.ondatachannel = (event) => {
-  dataChannel = event.channel;
-  dataChannel.binaryType = "arraybuffer"; // ★ 追加！
 
-  dataChannel.onopen = () => {
-  lastInputTime = performance.now();
-    dcKeepAliveInterval = setInterval(() => {
-      if (dataChannel.readyState === "open") {
-        dataChannel.send(new Uint8Array([0]));
-      }
-    }, 5000);
-    startGamepadPolling();
-	startSyncWatchdog(); 
-  };
-  dataChannel.onclose = () => {
-    if (dcKeepAliveInterval) clearInterval(dcKeepAliveInterval);
-    dcKeepAliveInterval = null;
-  };
-  dataChannel.onmessage = (e) => {};
+  newPc.ondatachannel = (event) => {
+    dataChannel = event.channel;
+    dataChannel.binaryType = "arraybuffer";
+
+    dataChannel.onopen = () => {
+      lastInputTime = performance.now();
+      dcKeepAliveInterval = setInterval(() => {
+        if (dataChannel.readyState === "open") {
+          dataChannel.send(new Uint8Array([0]));
+        }
+      }, 5000);
+      startGamepadPolling();
+      startSyncWatchdog();
+    };
+
+dataChannel.onmessage = (e) => {
+  const buf = new Uint8Array(e.data);
+  if (buf.length === 1 && buf[0] === 0) return; // keepalive
+
+  if (buf[0] === 1 && buf.length === 5) {
+    const ts = buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
+    lastVideoTimestamp = ts;
+
+    // 再生中で、まだvideoStartTimestampがセットされてなければここでセット
+if (
+  videoStartTimestamp === null &&
+  video &&
+  !video.paused &&
+  video.readyState >= 2
+) {
+  videoStartTimestamp = lastVideoTimestamp;
+  videoStartPerfTime = performance.now();
+  console.log("▶️ (onmessage側) 再生開始基準: serverTS =", videoStartTimestamp, " perf.now =", videoStartPerfTime);
+
+  if (!syncIntervalId) {
+    startSyncWatchdog();  // ★ ここでも保証
+  }
+}
+  }
 };
+
+
+  };
 
   return newPc;
 }
@@ -101,7 +124,15 @@ function closePeerConnection() {
     clearInterval(dcKeepAliveInterval);
     dcKeepAliveInterval = null;
   }
+  // ★ ここで基準もリセット
+  videoStartTimestamp = null;
+  videoStartPerfTime = null;
+  if (syncIntervalId) {
+    clearInterval(syncIntervalId);
+    syncIntervalId = null;
+  }
 }
+
 
 function connect() {
   const url = document.getElementById("wssUrl").value;
@@ -231,10 +262,19 @@ function toggleConnection() {
     document.getElementById("remoteVideo").srcObject = null;
     connected = false;
     updateButton();
+    videoStartTimestamp = null;
+    videoStartPerfTime = null;
+    // ★
+    if (syncIntervalId) {
+      clearInterval(syncIntervalId);
+      syncIntervalId = null;
+    }
   } else {
     connect();
   }
 }
+
+
 
 // 映像クリックで停止しないように
 const remoteVideo = document.getElementById("remoteVideo");
@@ -388,35 +428,41 @@ function updateButton() {
     window.addEventListener("gamepaddisconnected", updateGamepadList);
   }
 }
+const video = document.getElementById("remoteVideo");
+
+video.addEventListener("play", () => {
+  if (lastVideoTimestamp !== null && videoStartTimestamp === null) {
+    videoStartTimestamp = lastVideoTimestamp;
+    videoStartPerfTime = performance.now();
+    console.log("▶️ 再生開始基準: serverTS =", videoStartTimestamp, " perf.now =", videoStartPerfTime);
+  }
+
+  // 強制的に startSyncWatchdog をここでも再開
+  if (!syncIntervalId) {
+    startSyncWatchdog();
+  }
+});
+
 function startSyncWatchdog() {
-  const video = document.getElementById("remoteVideo");
+  // すでにintervalが動いていれば止める
+  if (syncIntervalId) {
+    clearInterval(syncIntervalId);
+    syncIntervalId = null;
+  }
+
   let lastVideoTime = 0;
   let sameInputDuration = 0;
-  let baseSystemTime = null;
   let lastResetTime = 0;
 
-  const syncInterval = setInterval(() => {
+  syncIntervalId = setInterval(() => {
     if (!video || !video.srcObject) {
-      console.log("🚫 no video or stream");
+      // ...
       return;
     }
 
     const now = performance.now();
-
-    // 回線が重くて onplay が発火しなくても強制初期化
-    if (baseSystemTime === null && video.currentTime > 0) {
-      baseSystemTime = now - video.currentTime * 1000;
-      console.log("🕒 [auto] baseSystemTime initialized");
-    }
-
-    if (baseSystemTime === null) {
-      console.log("⏳ waiting for baseSystemTime...");
-      return;
-    }
-
-    const inputElapsed = now - lastInputTime;
-
     const currentVideoTime = video.currentTime;
+
     if (currentVideoTime === lastVideoTime) {
       sameInputDuration += 500;
     } else {
@@ -424,37 +470,47 @@ function startSyncWatchdog() {
     }
     lastVideoTime = currentVideoTime;
 
-    const streamDelayRaw = (now - baseSystemTime) / 1000 - currentVideoTime;
-    if (streamDelayRaw < -0.5) return;
+    if (videoStartTimestamp !== null && videoStartPerfTime !== null) {
+      const elapsed = (performance.now() - videoStartPerfTime) / 1000;
+      const expectedServerNow = videoStartTimestamp + elapsed;
+      const actualServerNow = Date.now() / 1000;
 
-    const streamDelay = Math.max(0, streamDelayRaw);
-    console.log("📊 streamDelay =", streamDelay.toFixed(3), "sec");
+      const rawDelay = actualServerNow - expectedServerNow;
+      const streamDelay = Math.max(0, rawDelay);
 
-    const shouldReset =
-      (sameInputDuration >= 1000 && streamDelay >= 0.3) ||
-      (streamDelay >= 1.0);
+      console.log("📊 再生基準 streamDelay =", streamDelay.toFixed(3), "sec");
 
-    if (shouldReset && now - lastResetTime >= 10000) {
-      console.warn("🔁 映像再同期: delay=" + streamDelay.toFixed(2) + "s");
+      const shouldReset =
+        (sameInputDuration >= 1000 && streamDelay >= 0.5) ||
+        (streamDelay >= 1.0);
 
-      try {
-        video.style.visibility = "hidden";
-        const stream = video.srcObject;
-        video.srcObject = null;
-        video.srcObject = stream;
-        setTimeout(() => {
-          video.style.visibility = "visible";
-        }, 100);
-      } catch (e) {
-        console.warn("再同期失敗:", e);
+      if (shouldReset && now - lastResetTime >= 10000) {
+        console.warn("🔁 映像再同期: delay=" + streamDelay.toFixed(2) + "s");
+        try {
+          video.style.visibility = "hidden";
+          const stream = video.srcObject;
+          video.srcObject = null;
+          video.srcObject = stream;
+          setTimeout(() => {
+            video.style.visibility = "visible";
+          }, 100);
+        } catch (e) {
+          console.warn("再同期失敗:", e);
+        }
+
+        lastResetTime = now;
+        lastVideoTime = 0;
+        sameInputDuration = 0;
+        videoStartTimestamp = null;
+        videoStartPerfTime = null;
+        // ★ intervalもリセット
+        clearInterval(syncIntervalId);
+        syncIntervalId = null;
       }
-
-      lastResetTime = now;
-      lastVideoTime = 0;
-      sameInputDuration = 0;
     }
-  }, 500);
+  }, 500); // ← ここの前のカンマの前は1個だけ }
 }
+
 
 </script>
 </body>
