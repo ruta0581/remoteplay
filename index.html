@@ -105,11 +105,11 @@ dataChannel.onmessage = (e) => {
 
   const type = buf[0];
 
-if (type === 1 && buf.length === 9) {
-  const hostTimestamp = Number(new DataView(buf.buffer).getBigUint64(1, true));
-  const clientTimestamp = Math.floor(performance.now());
-  const delay = Math.max(0, clientTimestamp - hostTimestamp);
-  console.log(`📺 映像遅延: ${delay}ms`);
+if (type === 1 && buf.length === 5) {
+  const streamTime = new DataView(buf.buffer).getFloat32(1, true);
+  const video = document.getElementById("remoteVideo");
+  const delay = Math.max(0, (video.currentTime - streamTime) * 1000);
+  console.log(`📺 映像遅延: ${Math.round(delay)}ms`);
 }
 if (type === 3 && buf.length === 9) {
   const pongTime = Number(new DataView(buf.buffer).getBigUint64(1, true));
