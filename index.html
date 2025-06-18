@@ -44,6 +44,7 @@
   </div>
   <br>
   <button id="connectBtn" onclick="toggleConnection()">接続</button>
+  <button id="resyncBtn" onclick="resyncVideo()">再同期</button>
 </div>
 <script>
 let pc = null, ws = null, clientId = null;
@@ -87,6 +88,8 @@ newPc.ondatachannel = (event) => {
       }
     }, 5000);
     startGamepadPolling();
+	startRTTMeasurement();
+
   };
 
   dataChannel.onclose = () => {
@@ -100,32 +103,25 @@ dataChannel.onmessage = (e) => {
   const buf = new Uint8Array(e.data);
   if (buf.length === 1 && buf[0] === 0) return;
 
-  if (buf[0] === 1 && buf.length === 5) {
-    const ts =
-      buf[1] | (buf[2] << 8) | (buf[3] << 16) | (buf[4] << 24);
-    const now = Date.now();
-    
-    // サーバーも Date.now() の下位32bit を送っている前提
-    const nowLow = now >>> 0;
-    const delta = (nowLow - ts + 0x100000000) % 0x100000000; // 32bitオーバーフロー補正
+  const type = buf[0];
 
-    // 無効値除外（±30秒以上ずれてるものは捨てる）
-    if (delta > 30000) {
-      console.warn("⚠️ 無効な映像timestamp破棄:", ts, "nowLow=", nowLow);
-      return;
-    }
-
-    const video = document.getElementById("remoteVideo");
-    const streamTime = video?.currentTime ?? 0;
-    console.log(`🎥 streamTime=${streamTime.toFixed(3)}s ⏱️ accurateStreamDelay = ${delta}ms`);
-
-    lastValidTimestamp = ts;
-  }
-};
-
+if (type === 1 && buf.length === 5) {
+  const hostTime = new DataView(buf.buffer).getFloat32(1, true);
+  const clientTime = remoteVideo.currentTime;
+  const delay = Math.max(0, (clientTime - hostTime) * 1000);
+  console.log(`📺 映像遅延: ${delay.toFixed(0)}ms`);
+}
+if (type === 3 && buf.length === 9) {
+  const pongTime = Number(new DataView(buf.buffer).getBigUint64(1, true));
+  const now = Math.floor(performance.now());
+  const rtt = now - pongTime;
+  console.log(`📡 RTT: ${rtt}ms`);
+  return;
+}
 
 };
 
+};
 
   return newPc;
 }
@@ -183,19 +179,13 @@ ws.onopen = () => {
       ws.send(JSON.stringify({ type: "ping" }));
     }
   }, 5000);
+  startAutoResyncMonitor();
 };
 
 
 
 ws.onmessage = async ({ data }) => {
   const msg = JSON.parse(data);
-
-  if (msg.type === "video-ts" && typeof msg.timestamp === "number") {
-    const now = Date.now();
-    const delay = now - msg.timestamp;
-    const streamTime = document.getElementById("remoteVideo")?.currentTime ?? 0;
-    console.log(`🎥 streamTime=${streamTime.toFixed(3)}s 🧭 WS delay = ${delay}ms`);
-  }
 
   if (msg.type === "pong") return;
 
@@ -279,10 +269,18 @@ function toggleConnection() {
     document.getElementById("remoteVideo").srcObject = null;
     connected = false;
     updateButton();
+
+    // 🔽 これを追加：
+    if (autoResyncTimer) {
+      clearInterval(autoResyncTimer);
+      autoResyncTimer = null;
+      console.log("🛑 自動再同期監視を停止しました");
+    }
   } else {
     connect();
   }
 }
+
 
 // 映像クリックで停止しないように
 const remoteVideo = document.getElementById("remoteVideo");
@@ -295,7 +293,6 @@ remoteVideo.addEventListener('pause', (e) => {
 function startGamepadPolling() {
   let lastButtonStates = [];
   let lastAxes = [];
-  let lastInputTime = 0;
   const indicator = document.getElementById("inputIndicator");
 
   function updateIndicator() {
@@ -347,26 +344,22 @@ function startGamepadPolling() {
 if (buttonChanged || axesChanged) {
   lastInputTime = performance.now();
 
-  // バイナリ構造: [0][14ボタン][6軸][タイムスタンプ: 4byte(ms)]
-  const buffer = new Uint8Array(1 + 14 + 6 + 4);
+  // バイナリ構造: [0][14ボタン→2byte][6軸→6byte]
+  const buffer = new Uint8Array(1 + 2 + 6);
   buffer[0] = 0; // type = 0 = gamepad
 
-  // buttons (14 x 1byte)
+  // buttons (14bit → 2バイト)
+  let btnBits = 0;
   for (let i = 0; i < 14; i++) {
-    buffer[1 + i] = buttons[i];
+    if (buttons[i]) btnBits |= (1 << i);
   }
+  buffer[1] = btnBits & 0xFF;
+  buffer[2] = (btnBits >> 8) & 0xFF;
 
   // axes (6 x 1byte)
   for (let i = 0; i < 6; i++) {
-    buffer[15 + i] = axesCombined[i];
+    buffer[3 + i] = axesCombined[i];
   }
-
-  // timestamp (uint32, little-endian)
-  const ts = Date.now();
-  buffer[21] = ts & 0xFF;
-  buffer[22] = (ts >> 8) & 0xFF;
-  buffer[23] = (ts >> 16) & 0xFF;
-  buffer[24] = (ts >> 24) & 0xFF;
 
   dataChannel.send(buffer);
 
@@ -437,7 +430,84 @@ function updateButton() {
     window.addEventListener("gamepaddisconnected", updateGamepadList);
   }
 }
+let lastResyncTime = 0;
 
+function resyncVideo() {
+  const now = Date.now();
+  if (now - lastResyncTime < 10000) {
+    console.warn("⏳ 再同期は10秒に1回までです");
+    return;
+  }
+  lastResyncTime = now;
+
+  const video = document.getElementById("remoteVideo");
+  if (video && video.srcObject) {
+    video.playbackRate = 2.0;
+    console.log("⏩ 映像と音声を一時的に早送り中");
+
+    setTimeout(() => {
+      video.playbackRate = 1.0;
+      console.log("⏹️ 再生速度を通常に戻しました");
+    }, 3000);
+  } else {
+    console.warn("⚠️ 映像ストリームが未接続のため、再同期できません");
+  }
+}
+let connectStartTime = null;
+let lastInputTime = 0;
+let autoResyncTimer = null;
+let autoResyncPending = false;
+
+function startAutoResyncMonitor() {
+  connectStartTime = performance.now();
+  lastResyncTime = 0;
+  autoResyncPending = false;
+
+  if (autoResyncTimer) clearInterval(autoResyncTimer);
+  autoResyncTimer = setInterval(() => {
+    const now = performance.now();
+    const elapsedSinceConnect = now - connectStartTime;
+    const elapsedSinceInput = now - lastInputTime;
+
+    const connectSec = Math.floor(elapsedSinceConnect / 1000);
+    const idleSec = Math.floor(elapsedSinceInput / 1000);
+
+    console.log(`🕒 自動再同期監視: 接続から${connectSec}s, 無操作${idleSec}s`);
+
+    // 条件1: 接続から1分経過していて、無操作1秒以上
+    if (elapsedSinceConnect >= 60000 && elapsedSinceInput >= 1000) {
+      resyncVideo();
+      console.log("🔄 自動再同期（無操作1秒）を実行しました");
+
+      connectStartTime = performance.now(); // タイマーリセット
+      autoResyncPending = false;
+      return;
+    }
+
+    // 条件2: 1分以上経過しているが無操作時間が短い → 強制実行
+    if (elapsedSinceConnect >= 60000 && elapsedSinceInput < 1000) {
+      resyncVideo();
+      console.log("⚠️ 自動再同期（操作続行中でも1分超）を強制実行しました");
+
+      connectStartTime = performance.now(); // タイマーリセット
+      autoResyncPending = false;
+      return;
+    }
+
+    // （それ以外のときはスキップ）
+  }, 1000); // 1秒間隔
+}
+function startRTTMeasurement() {
+  setInterval(() => {
+    if (dataChannel && dataChannel.readyState === "open") {
+      const now = Math.floor(performance.now());
+      const buf = new Uint8Array(9);
+      buf[0] = 2; // ping
+      new DataView(buf.buffer).setBigUint64(1, BigInt(now), true);
+      dataChannel.send(buf);
+    }
+  }, 3000);
+}
 </script>
 </body>
 </html>
