@@ -160,6 +160,8 @@ function closePeerConnection() {
 }
 
 function connect() {
+  baseStreamTime = null;
+  lastStreamLogTime = 0;
   const url = document.getElementById("wssUrl").value;
   if (!/^wss:\/\/.+/.test(url)) {
     alert("正しいWSSアドレスを入力してください");
@@ -453,25 +455,22 @@ let lastResyncTime = 0;
 
 function resyncVideo() {
   const now = Date.now();
-  if (now - lastResyncTime < 10000) {
-    console.warn("⏳ 再同期は10秒に1回までです");
-    return;
-  }
   lastResyncTime = now;
 
   const video = document.getElementById("remoteVideo");
   if (video && video.srcObject) {
-    video.playbackRate = 2.0;
+    video.playbackRate = 2.0; // 一時的に早送り
     console.log("⏩ 映像と音声を一時的に早送り中");
 
     setTimeout(() => {
       video.playbackRate = 1.0;
       console.log("⏹️ 再生速度を通常に戻しました");
-    }, 3000);
+    }, 2000);
   } else {
     console.warn("⚠️ 映像ストリームが未接続のため、再同期できません");
   }
 }
+
 let connectStartTime = null;
 let lastInputTime = 0;
 let autoResyncTimer = null;
