@@ -24,7 +24,7 @@
   </style>
 </head>
 <body>
-  <video id="remoteVideo" autoplay playsinline></video>
+  <video id="remoteVideo" autoplay playsinline controls></video>
 <div id="ctrl">
   <input id="playerName" placeholder="名前 (最大8文字)" maxlength="8" style="width: 400px; margin-bottom: 8px;"><br>
   <input id="wssUrl" placeholder="wss://..." style="width: 400px; margin-bottom: 8px;"><br>
@@ -455,18 +455,26 @@ let lastResyncTime = 0;
 
 function resyncVideo() {
   const video = document.getElementById("remoteVideo");
-  if (video && video.srcObject) {
-    const stream = video.srcObject;
-    video.srcObject = null;
-    setTimeout(() => {
-      video.srcObject = stream;
-      console.log("🔄 映像を再同期しました");
-    }, 10); // 少し遅らせて再適用
-  } else {
+  if (!video || !video.srcObject) {
     console.warn("⚠️ 映像ストリームが未接続のため、再同期できません");
+    return;
   }
-}
 
+  const stream = video.srcObject;
+  const tracks = stream.getVideoTracks();
+  if (tracks.length === 0) {
+    console.warn("⚠️ 映像トラックが存在しません");
+    return;
+  }
+
+  // 一度トラックを停止し、再度追加する
+  const [track] = tracks;
+  stream.removeTrack(track);
+  stream.addTrack(track); // addTrack し直して MediaStream を更新
+
+  video.play().catch(err => console.warn("再生失敗:", err));
+  console.log("🔄 track再追加による映像再同期を実行しました");
+}
 
 let connectStartTime = null;
 let lastInputTime = 0;
