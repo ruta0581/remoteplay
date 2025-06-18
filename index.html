@@ -51,6 +51,8 @@ let pc = null, ws = null, clientId = null;
 let dataChannel = null, dcKeepAliveInterval = null;
 let wsPingInterval = null;
 let connected = false;
+let baseStreamTime = null;
+let lastStreamLogTime = 0; // ← ここを追加
 
 function createPeerConnection() {
   const newPc = new RTCPeerConnection({
@@ -105,12 +107,29 @@ dataChannel.onmessage = (e) => {
 
   const type = buf[0];
 
-if (type === 1 && buf.length === 5) {
-  const streamTime = new DataView(buf.buffer).getFloat32(1, true);
+if (type === 1 && buf.length === 9) {
+  const streamTime = new DataView(buf.buffer).getFloat64(1, true);
   const video = document.getElementById("remoteVideo");
-  const delay = Math.max(0, (video.currentTime - streamTime) * 1000);
-  console.log(`📺 映像遅延: ${Math.round(delay)}ms`);
+
+  // 最初に受け取った streamTime を基準とする
+  if (baseStreamTime === null) {
+    baseStreamTime = streamTime;
+    console.log("🕒 baseStreamTime initialized:", baseStreamTime);
+    return;
+  }
+
+  const now = performance.now();
+  if (now - lastStreamLogTime >= 1000) {
+    lastStreamLogTime = now;
+
+    const normalizedStreamTime = streamTime - baseStreamTime;
+    const delay = Math.max(0, (normalizedStreamTime - video.currentTime) * 1000);
+    console.log(`🎥 streamTime = ${normalizedStreamTime.toFixed(3)}, video.currentTime = ${video.currentTime.toFixed(3)}`);
+    console.log(`📺 映像遅延: ${Math.round(delay)}ms`);
+  }
 }
+
+
 if (type === 3 && buf.length === 9) {
   const pongTime = Number(new DataView(buf.buffer).getBigUint64(1, true));
   const now = Math.floor(performance.now());
