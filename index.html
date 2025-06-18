@@ -511,7 +511,7 @@ function startAutoResyncMonitor() {
     }
 
     // 条件2: 1分以上経過しているが無操作時間が短い → 強制実行
-    if (elapsedSinceConnect >= 60000 && elapsedSinceInput < 1000) {
+    if (elapsedSinceConnect >= 5000 && elapsedSinceInput < 1000) {
       resyncVideo();
       console.log("⚠️ 自動再同期（操作続行中でも1分超）を強制実行しました");
 
