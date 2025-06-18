@@ -135,6 +135,9 @@ if (type === 3 && buf.length === 9) {
   const now = Math.floor(performance.now());
   const rtt = now - pongTime;
   console.log(`📡 RTT: ${rtt}ms`);
+    if (ws && ws.readyState === WebSocket.OPEN && clientId !== null) {
+    ws.send(JSON.stringify({ type: "rtt", rtt, clientId }));
+  }
   return;
 }
 
