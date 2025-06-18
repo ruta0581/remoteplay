@@ -113,7 +113,7 @@ if (type === 1 && buf.length === 9) {
 
   // 最初に受け取った streamTime を基準とする
   if (baseStreamTime === null) {
-    baseStreamTime = streamTime;
+    baseStreamTime = streamTime - 1;
     console.log("🕒 baseStreamTime initialized:", baseStreamTime);
     return;
   }
@@ -454,22 +454,19 @@ function updateButton() {
 let lastResyncTime = 0;
 
 function resyncVideo() {
-  const now = Date.now();
-  lastResyncTime = now;
-
   const video = document.getElementById("remoteVideo");
   if (video && video.srcObject) {
-    video.playbackRate = 2.0; // 一時的に早送り
-    console.log("⏩ 映像と音声を一時的に早送り中");
-
+    const stream = video.srcObject;
+    video.srcObject = null;
     setTimeout(() => {
-      video.playbackRate = 1.0;
-      console.log("⏹️ 再生速度を通常に戻しました");
-    }, 2000);
+      video.srcObject = stream;
+      console.log("🔄 映像を再同期しました");
+    }, 10); // 少し遅らせて再適用
   } else {
     console.warn("⚠️ 映像ストリームが未接続のため、再同期できません");
   }
 }
+
 
 let connectStartTime = null;
 let lastInputTime = 0;
