@@ -52,7 +52,9 @@ let dataChannel = null, dcKeepAliveInterval = null;
 let wsPingInterval = null;
 let connected = false;
 let baseStreamTime = null;
-let lastStreamLogTime = 0; // ← ここを追加
+let lastStreamLogTime = 0;
+let lastInputTime = 0;   // ←★これを追加
+let autoResyncInterval = null; 
 
 function createPeerConnection() {
   const newPc = new RTCPeerConnection({
@@ -203,7 +205,8 @@ ws.onopen = () => {
       ws.send(JSON.stringify({ type: "ping" }));
     }
   }, 5000);
-  startAutoResyncMonitor();
+      if (autoResyncInterval) clearInterval(autoResyncInterval);
+    autoResyncInterval = setInterval(resyncVideo, 2000);
 };
 
 
@@ -293,13 +296,6 @@ function toggleConnection() {
     document.getElementById("remoteVideo").srcObject = null;
     connected = false;
     updateButton();
-
-    // 🔽 これを追加：
-    if (autoResyncTimer) {
-      clearInterval(autoResyncTimer);
-      autoResyncTimer = null;
-      console.log("🛑 自動再同期監視を停止しました");
-    }
   } else {
     connect();
   }
@@ -477,51 +473,6 @@ function resyncVideo() {
 
   video.play().catch(err => console.warn("再生失敗:", err));
   console.log("🔄 track再追加による映像再同期を実行しました");
-}
-
-let connectStartTime = null;
-let lastInputTime = 0;
-let autoResyncTimer = null;
-let autoResyncPending = false;
-
-function startAutoResyncMonitor() {
-  connectStartTime = performance.now();
-  lastResyncTime = 0;
-  autoResyncPending = false;
-
-  if (autoResyncTimer) clearInterval(autoResyncTimer);
-  autoResyncTimer = setInterval(() => {
-    const now = performance.now();
-    const elapsedSinceConnect = now - connectStartTime;
-    const elapsedSinceInput = now - lastInputTime;
-
-    const connectSec = Math.floor(elapsedSinceConnect / 1000);
-    const idleSec = Math.floor(elapsedSinceInput / 1000);
-
-    console.log(`🕒 自動再同期監視: 接続から${connectSec}s, 無操作${idleSec}s`);
-
-    // 条件1: 接続から1分経過していて、無操作1秒以上
-    if (elapsedSinceConnect >= 60000 && elapsedSinceInput >= 1000) {
-      resyncVideo();
-      console.log("🔄 自動再同期（無操作1秒）を実行しました");
-
-      connectStartTime = performance.now(); // タイマーリセット
-      autoResyncPending = false;
-      return;
-    }
-
-    // 条件2: 1分以上経過しているが無操作時間が短い → 強制実行
-    if (elapsedSinceConnect >= 5000 && elapsedSinceInput < 1000) {
-      resyncVideo();
-      console.log("⚠️ 自動再同期（操作続行中でも1分超）を強制実行しました");
-
-      connectStartTime = performance.now(); // タイマーリセット
-      autoResyncPending = false;
-      return;
-    }
-
-    // （それ以外のときはスキップ）
-  }, 1000); // 1秒間隔
 }
 function startRTTMeasurement() {
   setInterval(() => {
