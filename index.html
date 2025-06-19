@@ -460,20 +460,14 @@ function resyncVideo() {
   }
 
   const stream = video.srcObject;
-  const tracks = stream.getVideoTracks();
-  if (tracks.length === 0) {
-    console.warn("⚠️ 映像トラックが存在しません");
-    return;
-  }
-
-  // 一度トラックを停止し、再度追加する
-  const [track] = tracks;
-  stream.removeTrack(track);
-  stream.addTrack(track); // addTrack し直して MediaStream を更新
-
-  video.play().catch(err => console.warn("再生失敗:", err));
-  console.log("🔄 track再追加による映像再同期を実行しました");
+  video.srcObject = null; // 一度クリア
+  setTimeout(() => {
+    video.srcObject = stream; // 再セット
+    video.play().catch(err => console.warn("再生失敗:", err));
+    console.log("🔄 srcObject再適用による映像再同期を実行しました");
+  }, 10);
 }
+
 function startRTTMeasurement() {
   setInterval(() => {
     if (dataChannel && dataChannel.readyState === "open") {
