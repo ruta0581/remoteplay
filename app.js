@@ -14,9 +14,25 @@ let hasConnectedOnce = false;
 let reloadScheduled = false;
 
 const STORAGE_KEY = "remoteplay_guest_settings";
+const LOG_STORAGE_KEY = "remoteplay_guest_log";
 
 const logElem = document.getElementById("log");
 const videoElem = document.getElementById("video");
+
+function restoreLogFromStorage() {
+  if (!logElem) return;
+  try {
+    const stored = localStorage.getItem(LOG_STORAGE_KEY);
+    if (stored) {
+      logElem.textContent = stored;
+      console.log("Restored previous log from storage");
+    }
+  } catch (err) {
+    console.warn("Failed to restore log", err);
+  }
+}
+
+
 const gamepadSelect = document.getElementById("gamepad-select");
 const refreshGamepadsBtn = document.getElementById("refresh-gamepads-btn");
 const guestNameInput = document.getElementById("guest-name");
@@ -34,7 +50,20 @@ if (videoElem) {
 
 function log(msg) {
   console.log(msg);
-  logElem.textContent += msg + "\n";
+  if (logElem) {
+    logElem.textContent += msg + "\n";
+  }
+  try {
+    const prev = localStorage.getItem(LOG_STORAGE_KEY) || "";
+    let next = prev + msg + "\n";
+    const maxLen = 100000;
+    if (next.length > maxLen) {
+      next = next.slice(next.length - maxLen);
+    }
+    localStorage.setItem(LOG_STORAGE_KEY, next);
+  } catch (err) {
+    console.warn("Failed to persist log", err);
+  }
 }
 
 function loadSavedSettings() {
@@ -293,6 +322,8 @@ async function start() {
 }
 
 restoreGuestSettings();
+
+restoreLogFromStorage();
 
 document.getElementById("connect-btn").onclick = () => {
   if (ws || pc) {
