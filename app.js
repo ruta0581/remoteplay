@@ -16,55 +16,41 @@ let reloadScheduled = false;
 const STORAGE_KEY = "remoteplay_guest_settings";
 const LOG_STORAGE_KEY = "remoteplay_guest_log";
 
+let logBuffer = "";
+
+
 const logElem = document.getElementById("log");
 const videoElem = document.getElementById("video");
-
-function restoreLogFromStorage() {
-  if (!logElem) return;
-  try {
-    const stored = localStorage.getItem(LOG_STORAGE_KEY);
-    if (stored) {
-      logElem.textContent = stored;
-      console.log("Restored previous log from storage");
-    }
-  } catch (err) {
-    console.warn("Failed to restore log", err);
-  }
-}
-
-
 const gamepadSelect = document.getElementById("gamepad-select");
 const refreshGamepadsBtn = document.getElementById("refresh-gamepads-btn");
 const guestNameInput = document.getElementById("guest-name");
 const wsUrlInput = document.getElementById("ws-url");
+const clearLogBtn = document.getElementById("clear-log-btn");
+const saveLogBtn = document.getElementById("save-log-btn");
 
-if (videoElem) {
-  ["pause", "playing", "waiting", "stalled", "ended"].forEach((ev) => {
-    videoElem.addEventListener(ev, () => log("video event: " + ev));
-  });
-  videoElem.addEventListener("error", () => {
-    const err = videoElem.error;
-    log("video event: error " + (err ? err.message : ""));
-  });
-}
 
 function log(msg) {
   console.log(msg);
-  if (logElem) {
-    logElem.textContent += msg + "\n";
-  }
-  try {
-    const prev = localStorage.getItem(LOG_STORAGE_KEY) || "";
-    let next = prev + msg + "\n";
-    const maxLen = 100000;
-    if (next.length > maxLen) {
-      next = next.slice(next.length - maxLen);
+  if (typeof msg !== "string") {
+    try {
+      msg = JSON.stringify(msg);
+    } catch (e) {
+      msg = String(msg);
     }
-    localStorage.setItem(LOG_STORAGE_KEY, next);
+  }
+  logBuffer += msg + "\n";
+  // keep last ~1M characters to avoid unbounded growth
+  if (logBuffer.length > 1_000_000) {
+    logBuffer = logBuffer.slice(logBuffer.length - 800_000);
+  }
+  logElem.textContent = logBuffer;
+  try {
+    localStorage.setItem(LOG_STORAGE_KEY, logBuffer);
   } catch (err) {
-    console.warn("Failed to persist log", err);
+    // ignore quota errors
   }
 }
+
 
 function loadSavedSettings() {
   try {
@@ -121,16 +107,6 @@ function setButtonLabel(label) {
 function setConnectionUiLocked(locked) {
   uiLocked = locked;
   const wsUrlInput = document.getElementById("ws-url");
-
-if (videoElem) {
-  ["pause", "playing", "waiting", "stalled", "ended"].forEach((ev) => {
-    videoElem.addEventListener(ev, () => log("video event: " + ev));
-  });
-  videoElem.addEventListener("error", () => {
-    const err = videoElem.error;
-    log("video event: error " + (err ? err.message : ""));
-  });
-}
   if (wsUrlInput) {
     wsUrlInput.disabled = locked;
   }
@@ -201,12 +177,6 @@ async function start() {
     };
 
     pc.ontrack = (event) => {
-      if (event.track) {
-        event.track.onmute = () => log("track muted: " + event.track.kind);
-        event.track.onunmute = () => log("track unmuted: " + event.track.kind);
-        event.track.onended = () => log("track ended: " + event.track.kind);
-      }
-
       log("ontrack: kind=" + event.track.kind + ", streams=" + event.streams.length);
 
       if (event.receiver && "playoutDelayHint" in event.receiver) {
@@ -322,8 +292,6 @@ async function start() {
 }
 
 restoreGuestSettings();
-
-restoreLogFromStorage();
 
 document.getElementById("connect-btn").onclick = () => {
   if (ws || pc) {
@@ -627,7 +595,6 @@ function startReceiverBufferLogging(receiver) {
   }
 
   let lastVideoFpsSample = null;
-  let zeroFpsCount = 0;
 
   bufferLogTimer = setInterval(async () => {
     try {
@@ -641,30 +608,20 @@ function startReceiverBufferLogging(receiver) {
           logged = true;
           const emitted = Number(report.jitterBufferEmittedCount ?? 0);
           const delaySeconds = Number(report.jitterBufferDelay ?? 0);
-          const packetsReceived = Number(report.packetsReceived ?? 0);
-          const packetsLost = Number(report.packetsLost ?? 0);
-          const framesDecoded = Number(report.framesDecoded ?? report.framesReceived ?? 0);
-          const framesDropped = Number(report.framesDropped ?? 0);
-          const freezeCount = Number(report.freezeCount ?? 0);
-          const totalDecodeTime = Number(report.totalDecodeTime ?? 0);
-          const jitter = Number(report.jitter ?? 0);
-          const timestampMs = Number(report.timestamp ?? 0);
-
           if (emitted > 0) {
             const avgMs = (delaySeconds / emitted) * 1000;
             const totalMs = delaySeconds * 1000;
             log(
-              `Receiver jitter buffer avg=${avgMs.toFixed(2)} ms (total=${totalMs.toFixed(
-                2
-              )} ms / emitted=${emitted})`
+              `Receiver jitter buffer avg=${avgMs.toFixed(2)} ms (total=${totalMs.toFixed(2)} ms / emitted=${emitted})`
             );
           } else {
             log(
-              `Receiver jitter buffer delay=${(delaySeconds * 1000).toFixed(
-                2
-              )} ms (emitted=${emitted})`
+              `Receiver jitter buffer delay=${(delaySeconds * 1000).toFixed(2)} ms (emitted=${emitted})`
             );
           }
+
+          const framesDecoded = Number(report.framesDecoded ?? report.framesReceived ?? 0);
+          const timestampMs = Number(report.timestamp ?? 0);
 
           if (
             lastVideoFpsSample &&
@@ -677,37 +634,14 @@ function startReceiverBufferLogging(receiver) {
             if (deltaFrames >= 0 && deltaMs > 0) {
               const fps = (deltaFrames * 1000) / deltaMs;
               log(
-                `Receiver video FPS=${fps.toFixed(2)} (frames=${deltaFrames}, ${(deltaMs / 1000).toFixed(
-                  2
-                )}s)`
+                `Receiver video FPS=${fps.toFixed(2)} (frames=${deltaFrames}, ${(deltaMs / 1000).toFixed(2)}s)`
               );
-
-              if (fps < 0.5) {
-                zeroFpsCount += 1;
-              } else {
-                zeroFpsCount = 0;
-              }
-
-              if (zeroFpsCount >= 5) {
-                log("Video seems frozen (FPS ~0 for 5s); disconnecting and scheduling reload");
-                if (!disconnecting) {
-                  disconnect();
-                }
-                return;
-              }
             }
           }
 
           if (Number.isFinite(framesDecoded) && Number.isFinite(timestampMs)) {
             lastVideoFpsSample = { framesDecoded, timestampMs };
           }
-
-          log(
-            `Receiver video stats: packetsReceived=${packetsReceived}, packetsLost=${packetsLost}, ` +
-              `framesDecoded=${framesDecoded}, framesDropped=${framesDropped}, freezeCount=${freezeCount}, ` +
-              `totalDecodeTime=${totalDecodeTime.toFixed ? totalDecodeTime.toFixed(3) : totalDecodeTime}, ` +
-              `jitter=${jitter}`
-          );
         }
       });
 
@@ -719,3 +653,43 @@ function startReceiverBufferLogging(receiver) {
     }
   }, 1000);
 }
+// Restore saved log and set up log control buttons
+(function initLogControls() {
+  try {
+    const saved = localStorage.getItem(LOG_STORAGE_KEY);
+    if (saved) {
+      logBuffer = saved;
+      logElem.textContent = saved;
+    }
+  } catch (e) {
+    // ignore
+  }
+
+  if (clearLogBtn) {
+    clearLogBtn.addEventListener("click", () => {
+      logBuffer = "";
+      logElem.textContent = "";
+      try {
+        localStorage.removeItem(LOG_STORAGE_KEY);
+      } catch (e) {
+        // ignore
+      }
+    });
+  }
+
+  if (saveLogBtn) {
+    saveLogBtn.addEventListener("click", () => {
+      const text = logBuffer || logElem.textContent || "";
+      const blob = new Blob([text], { type: "text/plain" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      const ts = new Date().toISOString().replace(/[:.]/g, "-");
+      a.href = url;
+      a.download = `guest-log-${ts}.txt`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    });
+  }
+})();
