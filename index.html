@@ -1,0 +1,36 @@
+
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>WebRTC Guest - Screen Capture</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>WebRTC Guest (Screen Capture)</h1>
+  <div class="input-row">
+    <label>名前:
+      <input id="guest-name" placeholder="ゲスト名を入力" size="24">
+    </label>
+  </div>
+    <div class="input-row">
+    <label for="gamepad-select">ゲームパッド:</label>
+    <select id="gamepad-select"></select>
+    <button id="refresh-gamepads-btn" type="button">更新</button>
+  </div>
+    <div class="input-row">
+    <label>WebSocket URL:
+      <input id="ws-url" value="ws://127.0.0.1:8080/ws" size="40">
+    </label>
+    <button id="connect-btn">接続</button>
+  </div>
+  
+  <h2>映像</h2>
+  <video id="video" autoplay playsinline controls></video>
+
+  <h2>ログ</h2>
+  <pre id="log"></pre>
+
+  <script src="app.js"></script>
+</body>
+</html>

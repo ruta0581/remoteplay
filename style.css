@@ -1,0 +1,14 @@
+body { font-family: sans-serif; }
+video { width: 960px; max-width: 100%; background: #000; }
+pre { border: 1px solid #ccc; padding: 8px; height: 200px; overflow: auto; }
+
+.input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+#gamepad-select {
+  min-width: 260px;
+}
