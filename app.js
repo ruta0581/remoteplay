@@ -22,6 +22,16 @@ const refreshGamepadsBtn = document.getElementById("refresh-gamepads-btn");
 const guestNameInput = document.getElementById("guest-name");
 const wsUrlInput = document.getElementById("ws-url");
 
+if (videoElem) {
+  ["pause", "playing", "waiting", "stalled", "ended"].forEach((ev) => {
+    videoElem.addEventListener(ev, () => log("video event: " + ev));
+  });
+  videoElem.addEventListener("error", () => {
+    const err = videoElem.error;
+    log("video event: error " + (err ? err.message : ""));
+  });
+}
+
 function log(msg) {
   console.log(msg);
   logElem.textContent += msg + "\n";
@@ -82,6 +92,16 @@ function setButtonLabel(label) {
 function setConnectionUiLocked(locked) {
   uiLocked = locked;
   const wsUrlInput = document.getElementById("ws-url");
+
+if (videoElem) {
+  ["pause", "playing", "waiting", "stalled", "ended"].forEach((ev) => {
+    videoElem.addEventListener(ev, () => log("video event: " + ev));
+  });
+  videoElem.addEventListener("error", () => {
+    const err = videoElem.error;
+    log("video event: error " + (err ? err.message : ""));
+  });
+}
   if (wsUrlInput) {
     wsUrlInput.disabled = locked;
   }
@@ -152,6 +172,12 @@ async function start() {
     };
 
     pc.ontrack = (event) => {
+      if (event.track) {
+        event.track.onmute = () => log("track muted: " + event.track.kind);
+        event.track.onunmute = () => log("track unmuted: " + event.track.kind);
+        event.track.onended = () => log("track ended: " + event.track.kind);
+      }
+
       log("ontrack: kind=" + event.track.kind + ", streams=" + event.streams.length);
 
       if (event.receiver && "playoutDelayHint" in event.receiver) {
@@ -570,6 +596,7 @@ function startReceiverBufferLogging(receiver) {
   }
 
   let lastVideoFpsSample = null;
+  let zeroFpsCount = 0;
 
   bufferLogTimer = setInterval(async () => {
     try {
@@ -583,20 +610,30 @@ function startReceiverBufferLogging(receiver) {
           logged = true;
           const emitted = Number(report.jitterBufferEmittedCount ?? 0);
           const delaySeconds = Number(report.jitterBufferDelay ?? 0);
+          const packetsReceived = Number(report.packetsReceived ?? 0);
+          const packetsLost = Number(report.packetsLost ?? 0);
+          const framesDecoded = Number(report.framesDecoded ?? report.framesReceived ?? 0);
+          const framesDropped = Number(report.framesDropped ?? 0);
+          const freezeCount = Number(report.freezeCount ?? 0);
+          const totalDecodeTime = Number(report.totalDecodeTime ?? 0);
+          const jitter = Number(report.jitter ?? 0);
+          const timestampMs = Number(report.timestamp ?? 0);
+
           if (emitted > 0) {
             const avgMs = (delaySeconds / emitted) * 1000;
             const totalMs = delaySeconds * 1000;
             log(
-              `Receiver jitter buffer avg=${avgMs.toFixed(2)} ms (total=${totalMs.toFixed(2)} ms / emitted=${emitted})`
+              `Receiver jitter buffer avg=${avgMs.toFixed(2)} ms (total=${totalMs.toFixed(
+                2
+              )} ms / emitted=${emitted})`
             );
           } else {
             log(
-              `Receiver jitter buffer delay=${(delaySeconds * 1000).toFixed(2)} ms (emitted=${emitted})`
+              `Receiver jitter buffer delay=${(delaySeconds * 1000).toFixed(
+                2
+              )} ms (emitted=${emitted})`
             );
           }
-
-          const framesDecoded = Number(report.framesDecoded ?? report.framesReceived ?? 0);
-          const timestampMs = Number(report.timestamp ?? 0);
 
           if (
             lastVideoFpsSample &&
@@ -609,14 +646,37 @@ function startReceiverBufferLogging(receiver) {
             if (deltaFrames >= 0 && deltaMs > 0) {
               const fps = (deltaFrames * 1000) / deltaMs;
               log(
-                `Receiver video FPS=${fps.toFixed(2)} (frames=${deltaFrames}, ${(deltaMs / 1000).toFixed(2)}s)`
+                `Receiver video FPS=${fps.toFixed(2)} (frames=${deltaFrames}, ${(deltaMs / 1000).toFixed(
+                  2
+                )}s)`
               );
+
+              if (fps < 0.5) {
+                zeroFpsCount += 1;
+              } else {
+                zeroFpsCount = 0;
+              }
+
+              if (zeroFpsCount >= 5) {
+                log("Video seems frozen (FPS ~0 for 5s); disconnecting and scheduling reload");
+                if (!disconnecting) {
+                  disconnect();
+                }
+                return;
+              }
             }
           }
 
           if (Number.isFinite(framesDecoded) && Number.isFinite(timestampMs)) {
             lastVideoFpsSample = { framesDecoded, timestampMs };
           }
+
+          log(
+            `Receiver video stats: packetsReceived=${packetsReceived}, packetsLost=${packetsLost}, ` +
+              `framesDecoded=${framesDecoded}, framesDropped=${framesDropped}, freezeCount=${freezeCount}, ` +
+              `totalDecodeTime=${totalDecodeTime.toFixed ? totalDecodeTime.toFixed(3) : totalDecodeTime}, ` +
+              `jitter=${jitter}`
+          );
         }
       });
 
