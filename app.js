@@ -15,6 +15,9 @@ let reloadScheduled = false;
 
 const STORAGE_KEY = "remoteplay_guest_settings";
 const LOG_STORAGE_KEY = "remoteplay_guest_log";
+const DEFAULT_VIDEO_QUEUE_FRAMES = 4;
+const MIN_VIDEO_QUEUE_FRAMES = 1;
+const DEFAULT_VIDEO_FPS = 60;
 
 let logBuffer = "";
 
@@ -25,8 +28,20 @@ const gamepadSelect = document.getElementById("gamepad-select");
 const refreshGamepadsBtn = document.getElementById("refresh-gamepads-btn");
 const guestNameInput = document.getElementById("guest-name");
 const wsUrlInput = document.getElementById("ws-url");
+const videoBufferFramesInput = document.getElementById("video-buffer-frames");
 const clearLogBtn = document.getElementById("clear-log-btn");
 const saveLogBtn = document.getElementById("save-log-btn");
+
+
+const savedSettings = loadSavedSettings();
+const initialVideoQueueFrames = getInitialVideoQueueFrames(savedSettings);
+let configuredVideoQueueFrames = initialVideoQueueFrames;
+let dynamicVideoQueueFrames = initialVideoQueueFrames;
+let videoReceiver = null;
+let videoTrack = null;
+let videoFrameRateEstimate = DEFAULT_VIDEO_FPS;
+let lastInboundVideoStats = null;
+let lastBufferLogJitterSeconds = null;
 
 
 function log(msg) {
@@ -62,6 +77,30 @@ function loadSavedSettings() {
   }
 }
 
+function clampVideoQueueFrames(value) {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_VIDEO_QUEUE_FRAMES;
+  }
+  return Math.max(MIN_VIDEO_QUEUE_FRAMES, Math.round(value));
+}
+
+function getInitialVideoQueueFrames(saved = {}) {
+  const params = new URLSearchParams(window.location.search);
+  const queryValue = params.get("videoQueueFrames") ?? params.get("video_queue_frames");
+  const fromQuery = clampVideoQueueFrames(Number(queryValue));
+
+  if (Number.isFinite(fromQuery) && queryValue !== null) {
+    log(`Using videoQueueFrames from query string: ${fromQuery}`);
+    return fromQuery;
+  }
+
+  if (Number.isFinite(saved.videoQueueFrames)) {
+    return clampVideoQueueFrames(saved.videoQueueFrames);
+  }
+
+  return DEFAULT_VIDEO_QUEUE_FRAMES;
+}
+
 function persistGuestSettings(overrides = {}) {
   const current = loadSavedSettings();
   const next = {
@@ -69,6 +108,9 @@ function persistGuestSettings(overrides = {}) {
     wsUrl: wsUrlInput?.value || current.wsUrl,
     guestName: guestNameInput?.value || current.guestName,
     gamepadIndex: selectedGamepadIndex,
+    videoQueueFrames:
+      overrides.videoQueueFrames ??
+      clampVideoQueueFrames(Number(videoBufferFramesInput?.value ?? current.videoQueueFrames)),
     ...overrides,
   };
   try {
@@ -78,13 +120,15 @@ function persistGuestSettings(overrides = {}) {
   }
 }
 
-function restoreGuestSettings() {
-  const saved = loadSavedSettings();
+function restoreGuestSettings(saved = savedSettings) {
   if (wsUrlInput && typeof saved.wsUrl === "string") {
     wsUrlInput.value = saved.wsUrl;
   }
   if (guestNameInput && typeof saved.guestName === "string") {
     guestNameInput.value = saved.guestName;
+  }
+  if (videoBufferFramesInput) {
+    videoBufferFramesInput.value = configuredVideoQueueFrames;
   }
   if (typeof saved.gamepadIndex === "number" && Number.isFinite(saved.gamepadIndex)) {
     selectedGamepadIndex = saved.gamepadIndex;
@@ -98,6 +142,101 @@ function scheduleReload() {
   reloadScheduled = true;
   persistGuestSettings();
   setTimeout(() => window.location.reload(), 50);
+}
+
+function getVideoFrameRate(track) {
+  const settings = typeof track?.getSettings === "function" ? track.getSettings() : undefined;
+  const frameRate = Number(settings?.frameRate);
+  if (Number.isFinite(frameRate) && frameRate > 0) {
+    return frameRate;
+  }
+  return DEFAULT_VIDEO_FPS;
+}
+
+function updateVideoFrameRateEstimate(track) {
+  const nextFrameRate = getVideoFrameRate(track ?? videoTrack);
+  if (!Number.isFinite(nextFrameRate) || nextFrameRate <= 0) {
+    return;
+  }
+
+  const frameRateChanged =
+    !Number.isFinite(videoFrameRateEstimate) ||
+    Math.abs(videoFrameRateEstimate - nextFrameRate) >= 0.25;
+
+  videoFrameRateEstimate = nextFrameRate;
+
+  if (frameRateChanged) {
+    log(`Video frameRate estimate updated: ${nextFrameRate.toFixed(2)}fps`);
+    applyVideoJitterBufferTarget("Frame rate updated");
+  }
+}
+
+function logVideoBufferUpdate(reason = "") {
+  const frameRate = Math.max(videoFrameRateEstimate || DEFAULT_VIDEO_FPS, 1);
+  const queueSeconds = dynamicVideoQueueFrames / frameRate;
+  const reasonText = reason ? `${reason}: ` : "";
+  log(
+    `${reasonText}jitterBufferTarget=${queueSeconds.toFixed(3)}s (~${dynamicVideoQueueFrames} frames @ ${frameRate.toFixed(1)}fps)`
+  );
+  lastBufferLogJitterSeconds = queueSeconds;
+}
+
+function getMaxVideoQueueFrames() {
+  return Math.max(MIN_VIDEO_QUEUE_FRAMES, configuredVideoQueueFrames + 2);
+}
+
+function applyVideoJitterBufferTarget(reason = "") {
+  const frameRate = Math.max(videoFrameRateEstimate || DEFAULT_VIDEO_FPS, 1);
+  const maxFrames = getMaxVideoQueueFrames();
+  dynamicVideoQueueFrames = clampVideoQueueFrames(
+    Math.min(dynamicVideoQueueFrames, maxFrames)
+  );
+  const queueSeconds = dynamicVideoQueueFrames / frameRate;
+
+  if (!videoReceiver || !("jitterBufferTarget" in videoReceiver)) {
+    log(
+      `Video receiver not ready; target buffer ${queueSeconds.toFixed(3)}s will be applied once available`
+    );
+    return;
+  }
+
+  try {
+    videoReceiver.jitterBufferTarget = queueSeconds;
+    if (lastBufferLogJitterSeconds !== queueSeconds || reason) {
+      logVideoBufferUpdate(reason || "Updated video jitterBufferTarget");
+    }
+  } catch (err) {
+    log(`Failed to set video jitterBufferTarget: ${err}`);
+  }
+}
+
+function setConfiguredVideoQueueFrames(frames, reason = "") {
+  configuredVideoQueueFrames = clampVideoQueueFrames(frames);
+  dynamicVideoQueueFrames = Math.min(dynamicVideoQueueFrames, getMaxVideoQueueFrames());
+  applyVideoJitterBufferTarget(reason || "Configured video buffer updated");
+}
+
+function adjustVideoJitterBufferFromStats(lossRate, nackDelta, retransDelta) {
+  const maxFrames = getMaxVideoQueueFrames();
+  let nextFrames = dynamicVideoQueueFrames;
+
+  const shouldGrow =
+    lossRate > 0.02 || nackDelta > 10 || retransDelta > 20 || Number.isNaN(lossRate);
+  const shouldShrink = lossRate >= 0 && lossRate < 0.005 && nackDelta === 0 && retransDelta < 5;
+
+  if (shouldGrow) {
+    nextFrames = Math.min(maxFrames, dynamicVideoQueueFrames + 1);
+  } else if (shouldShrink) {
+    nextFrames = Math.max(MIN_VIDEO_QUEUE_FRAMES, dynamicVideoQueueFrames - 1);
+  }
+
+  if (nextFrames !== dynamicVideoQueueFrames) {
+    const changeKind = nextFrames > dynamicVideoQueueFrames ? "increase" : "decrease";
+    dynamicVideoQueueFrames = nextFrames;
+    applyVideoJitterBufferTarget(
+      `Auto ${changeKind} (loss=${(lossRate * 100).toFixed(2)}%, nack=${nackDelta}, retrans=${retransDelta})`
+    );
+  }
 }
 
 function setButtonLabel(label) {
@@ -131,9 +270,166 @@ function resetState() {
   }
 }
 
+function createPeerConnection() {
+  const pc = new RTCPeerConnection({
+    iceServers: [
+      {
+        urls: ["stun:stun.l.google.com:19302"]
+      }
+    ],
+    sdpSemantics: "unified-plan"
+  });
+
+  const videoTransceiver = pc.addTransceiver("video", { direction: "recvonly" });
+  applyCodecPreference(videoTransceiver, "video", (codec) => {
+    const mime = codec.mimeType?.toLowerCase() || "";
+    const fmtp = codec.sdpFmtpLine || "";
+    return mime === "video/h264" && fmtp.includes("packetization-mode=1");
+  });
+
+  const audioTransceiver = pc.addTransceiver("audio", { direction: "recvonly" });
+  applyCodecPreference(audioTransceiver, "audio", (codec) => {
+    const mime = codec.mimeType?.toLowerCase() || "";
+    return mime === "audio/opus";
+  });
+
+  pc.onconnectionstatechange = () => {
+    log("pc.connectionState=" + pc.connectionState);
+  };
+
+  pc.oniceconnectionstatechange = () => {
+    log("pc.iceConnectionState=" + pc.iceConnectionState);
+  };
+
+  return pc;
+}
+
+function applyCodecPreference(transceiver, kind, predicate) {
+  if (!transceiver || typeof transceiver.setCodecPreferences !== "function") {
+    return;
+  }
+
+  const caps = RTCRtpReceiver.getCapabilities(kind);
+  const preferred = caps?.codecs?.filter((codec) => predicate(codec)) || [];
+  if (preferred.length === 0) {
+    return;
+  }
+
+  try {
+    transceiver.setCodecPreferences(preferred);
+    log(`Preferred ${kind} codecs: ${preferred.map((c) => c.mimeType).join(", ")}`);
+  } catch (err) {
+    log(`Failed to set ${kind} codec preferences: ${err}`);
+  }
+}
+
+function setupIceHandlers(conn) {
+  conn.onicecandidate = (e) => {
+    if (disconnecting || !ws || ws.readyState !== WebSocket.OPEN) {
+      return;
+    }
+
+    if (e.candidate) {
+      ws.send(
+        JSON.stringify({
+          type: "candidate",
+          candidate: e.candidate.toJSON()
+        })
+      );
+    }
+  };
+}
+
+function setupTrackHandlers(conn) {
+  conn.ontrack = (event) => {
+    log("ontrack: kind=" + event.track.kind + ", streams=" + event.streams.length);
+
+    if (event.receiver && "playoutDelayHint" in event.receiver) {
+      try {
+        event.receiver.playoutDelayHint = 0;
+        log("Set receiver playoutDelayHint to 0");
+      } catch (err) {
+        log("Failed to set playoutDelayHint: " + err);
+      }
+    }
+
+    attachTrack(event.track, event.receiver);
+  };
+}
+
+function attachTrack(track, receiver) {
+  if (!track) {
+    return;
+  }
+
+  if (!remoteStream) {
+    remoteStream = new MediaStream();
+  }
+
+  const alreadyAdded = remoteStream.getTracks().some((t) => t.id === track.id);
+  if (!alreadyAdded) {
+    remoteStream.addTrack(track);
+  }
+
+  if (videoElem && videoElem.srcObject !== remoteStream) {
+    videoElem.srcObject = remoteStream;
+  }
+
+  if (track.kind === "video" && receiver && "jitterBufferTarget" in receiver) {
+    videoReceiver = receiver;
+    videoTrack = track;
+    lastInboundVideoStats = null;
+    updateVideoFrameRateEstimate(track);
+    dynamicVideoQueueFrames = clampVideoQueueFrames(configuredVideoQueueFrames);
+    applyVideoJitterBufferTarget("Initial video track attachment");
+  }
+
+  if (track.kind === "audio" && videoElem) {
+    videoElem.muted = false;
+  }
+
+  const startPlayback = () => {
+    if (receiver && track.kind === "video") {
+      startReceiverBufferLogging(receiver, track);
+    }
+
+    const playPromise = videoElem?.play?.();
+    if (playPromise !== undefined) {
+      playPromise.catch((err) => {
+        log("video.play error: " + err);
+      });
+    }
+  };
+
+  if (typeof track.addEventListener === "function") {
+    track.addEventListener("unmute", startPlayback, { once: true });
+  }
+
+  startPlayback();
+}
+
+function setupDataChannel(conn) {
+  dc = conn.createDataChannel("input");
+  dc.onopen = () => {
+    if (disconnecting) {
+      return;
+    }
+    log("DataChannel open");
+    startGamepadLoop();
+  };
+  dc.onclose = () => {
+    stopGamepadLoop();
+    log("DataChannel closed");
+  };
+  dc.onmessage = (ev) => {
+    handleDataChannelMessage(ev.data);
+  };
+}
+
 async function start() {
   const wsUrl = wsUrlInput?.value || "";
   const guestName = (guestNameInput?.value || "").trim();
+
   ws = new WebSocket(wsUrl);
   disconnecting = false;
   setConnectionUiLocked(true);
@@ -143,8 +439,8 @@ async function start() {
     hasConnectedOnce = true;
     persistGuestSettings({ wsUrl, guestName });
     if (disconnecting) {
-      ws.close();
-      return;
+        ws.close();
+        return;
     }
     log("WebSocket open");
 
@@ -152,87 +448,10 @@ async function start() {
       sendGuestName(guestName);
     }
 
-    pc = new RTCPeerConnection({
-      iceServers: []
-    });
-
-    pc.onicecandidate = (e) => {
-      if (disconnecting || !ws || ws.readyState !== WebSocket.OPEN) {
-        return;
-      }
-      if (e.candidate) {
-        ws.send(JSON.stringify({
-          type: "candidate",
-          candidate: e.candidate.toJSON()
-        }));
-      }
-    };
-
-    pc.onconnectionstatechange = () => {
-      log("pc.connectionState=" + pc.connectionState);
-    };
-
-    pc.oniceconnectionstatechange = () => {
-      log("pc.iceConnectionState=" + pc.iceConnectionState);
-    };
-
-    pc.ontrack = (event) => {
-      log("ontrack: kind=" + event.track.kind + ", streams=" + event.streams.length);
-
-      if (event.receiver && "playoutDelayHint" in event.receiver) {
-        try {
-          event.receiver.playoutDelayHint = 0;
-          log("Set receiver playoutDelayHint to 0");
-        } catch (err) {
-          log("Failed to set playoutDelayHint: " + err);
-        }
-      }
-
-      if (event.track.kind === "video") {
-        startReceiverBufferLogging(event.receiver);
-      }
-
-      if (!remoteStream) {
-        remoteStream = new MediaStream();
-        videoElem.srcObject = remoteStream;
-      }
-
-      if (!remoteStream.getTracks().includes(event.track)) {
-        remoteStream.addTrack(event.track);
-      }
-
-      if (event.track.kind === "audio") {
-        videoElem.muted = false;
-      }
-
-      const p = videoElem.play();
-      if (p !== undefined) {
-        p.catch((err) => {
-          log("video.play error: " + err);
-        });
-      }
-    };
-
-    // ホストからの映像を受信したいことを SDP に表明
-    pc.addTransceiver("video", { direction: "recvonly" });
-    pc.addTransceiver("audio", { direction: "recvonly" });
-
-    // DataChannel（テスト用）
-    dc = pc.createDataChannel("input");
-    dc.onopen = () => {
-      if (disconnecting) {
-        return;
-      }
-      log("DataChannel open");
-      startGamepadLoop();
-    };
-    dc.onclose = () => {
-      stopGamepadLoop();
-      log("DataChannel closed");
-    };
-    dc.onmessage = (ev) => {
-      handleDataChannelMessage(ev.data);
-    };
+    pc = createPeerConnection();
+    setupIceHandlers(pc);
+    setupTrackHandlers(pc);
+    setupDataChannel(pc);
 
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -328,6 +547,15 @@ if (guestNameInput) {
 if (wsUrlInput) {
   wsUrlInput.onchange = (event) => {
     persistGuestSettings({ wsUrl: event.target.value });
+  };
+}
+
+if (videoBufferFramesInput) {
+  videoBufferFramesInput.onchange = (event) => {
+    const parsed = clampVideoQueueFrames(Number(event.target.value));
+    videoBufferFramesInput.value = parsed;
+    setConfiguredVideoQueueFrames(parsed, "Manual video buffer update");
+    persistGuestSettings({ videoQueueFrames: parsed });
   };
 }
 
@@ -583,7 +811,7 @@ function normalizeCandidate(candidate) {
   };
 }
 
-function startReceiverBufferLogging(receiver) {
+function startReceiverBufferLogging(receiver, track) {
   if (bufferLogTimer !== null) {
     clearInterval(bufferLogTimer);
     bufferLogTimer = null;
@@ -595,9 +823,13 @@ function startReceiverBufferLogging(receiver) {
   }
 
   let lastVideoFpsSample = null;
+  lastInboundVideoStats = null;
+  updateVideoFrameRateEstimate(track);
+  logVideoBufferUpdate("Starting jitter buffer logging");
 
   bufferLogTimer = setInterval(async () => {
     try {
+      updateVideoFrameRateEstimate(track);
       const stats = await receiver.getStats();
       let logged = false;
       stats.forEach((report) => {
@@ -622,6 +854,10 @@ function startReceiverBufferLogging(receiver) {
 
           const framesDecoded = Number(report.framesDecoded ?? report.framesReceived ?? 0);
           const timestampMs = Number(report.timestamp ?? 0);
+          const packetsReceived = Number(report.packetsReceived ?? 0);
+          const packetsLost = Number(report.packetsLost ?? 0);
+          const nackCount = Number(report.nackCount ?? report.nacksReceived ?? 0);
+          const retransmissions = Number(report.retransmittedPacketsReceived ?? 0);
 
           if (
             lastVideoFpsSample &&
@@ -639,9 +875,32 @@ function startReceiverBufferLogging(receiver) {
             }
           }
 
+          if (lastInboundVideoStats) {
+            const deltaReceived = Math.max(
+              0,
+              packetsReceived - lastInboundVideoStats.packetsReceived
+            );
+            const deltaLost = Math.max(0, packetsLost - lastInboundVideoStats.packetsLost);
+            const deltaNack = Math.max(0, nackCount - lastInboundVideoStats.nackCount);
+            const deltaRetrans = Math.max(
+              0,
+              retransmissions - lastInboundVideoStats.retransmissions
+            );
+            const total = deltaReceived + deltaLost;
+            const lossRate = total > 0 ? Math.max(0, deltaLost) / total : 0;
+            adjustVideoJitterBufferFromStats(lossRate, deltaNack, deltaRetrans);
+          }
+
           if (Number.isFinite(framesDecoded) && Number.isFinite(timestampMs)) {
             lastVideoFpsSample = { framesDecoded, timestampMs };
           }
+
+          lastInboundVideoStats = {
+            packetsReceived,
+            packetsLost,
+            nackCount,
+            retransmissions,
+          };
         }
       });
 

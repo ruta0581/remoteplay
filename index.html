@@ -18,13 +18,20 @@
     <select id="gamepad-select"></select>
     <button id="refresh-gamepads-btn" type="button">更新</button>
   </div>
-    <div class="input-row">
+  <div class="input-row">
     <label>WebSocket URL:
       <input id="ws-url" value="ws://127.0.0.1:8080/ws" size="40">
     </label>
     <button id="connect-btn">接続</button>
   </div>
-  
+
+  <div class="input-row">
+    <label>ビデオバッファ (フレーム):
+      <input id="video-buffer-frames" type="number" min="1" step="1" value="4" size="4">
+    </label>
+    <span class="hint">低遅延重視なら 1–2 が目安</span>
+  </div>
+
   <h2>映像</h2>
   <video id="video" autoplay playsinline controls></video>
 
