@@ -1,47 +1,155 @@
-
-<!DOCTYPE html>
+<!doctype html>
 <html lang="ja">
 <head>
-  <meta charset="UTF-8">
-  <title>WebRTC Guest - Screen Capture</title>
-  <link rel="stylesheet" href="style.css">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#07101d">
+  <meta name="description" content="RemotePlay Rustホストへ接続する低遅延ブラウザゲスト">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:; connect-src ws: wss:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>RemotePlay Web Guest</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg:#07101d;--panel:rgba(13,25,42,.8);--line:rgba(159,190,224,.16);
+      --text:#f3f8ff;--muted:#91a3b8;--cyan:#57e4ff;--lime:#b8f36b;
+      --danger:#ff747c;--warning:#ffd166;
+      font-family:Inter,"Segoe UI","Yu Gothic UI",sans-serif;
+    }
+    *{box-sizing:border-box} html{min-height:100%;background:var(--bg)}
+    body{min-height:100vh;margin:0;color:var(--text);background:radial-gradient(circle at 18% 0,rgba(30,138,183,.2),transparent 34rem),linear-gradient(145deg,#07101d,#081523 52%,#050b14);overflow-x:hidden}
+    button,input,select{font:inherit} button{color:inherit}.shell{width:min(1180px,calc(100% - 40px));margin:auto;padding:36px 0 28px}
+    header{display:flex;align-items:end;justify-content:space-between;gap:24px;margin-bottom:22px}
+    .eyebrow,.number{margin:0 0 7px;color:var(--cyan);font-size:.7rem;font-weight:800;letter-spacing:.2em}
+    h1,h2,p{margin-top:0}h1{margin-bottom:0;font-size:clamp(1.8rem,4vw,3.2rem);line-height:1.05;letter-spacing:-.045em}h2{margin-bottom:0;font-size:1.18rem}
+    .badge{display:flex;align-items:center;gap:9px;min-width:116px;padding:9px 14px;border:1px solid var(--line);border-radius:999px;background:rgba(5,12,21,.65);color:var(--muted);font-size:.8rem;font-weight:700}
+    .dot,.pulse{width:8px;height:8px;border-radius:50%;background:#65768a;box-shadow:0 0 0 4px rgba(101,118,138,.12)}
+    .badge[data-state=connecting] .dot{background:var(--warning);animation:pulse 1.2s infinite}.badge[data-state=connected]{color:var(--lime)}.badge[data-state=connected] .dot,.pulse.active{background:var(--lime);box-shadow:0 0 0 4px rgba(184,243,107,.12),0 0 16px rgba(184,243,107,.35)}.badge[data-state=error]{color:var(--danger)}.badge[data-state=error] .dot{background:var(--danger)}
+    @keyframes pulse{50%{opacity:.35}}
+    .card,.panel,.metrics,details{border:1px solid var(--line);border-radius:20px;background:var(--panel);box-shadow:0 28px 80px rgba(0,0,0,.34);backdrop-filter:blur(18px)}
+    .card{overflow:hidden;border-radius:0}.stage{position:relative;aspect-ratio:16/9;overflow:hidden;background:#02060b}video{display:block;width:100%;height:100%;object-fit:contain;background:#02060b}
+    .placeholder{position:absolute;inset:0;display:grid;place-content:center;justify-items:center;padding:24px;text-align:center;background:linear-gradient(rgba(87,228,255,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(87,228,255,.035) 1px,transparent 1px),#050b13;background-size:44px 44px;transition:opacity .18s}.stage.has-video .placeholder{visibility:hidden;opacity:0}
+    .mark{display:flex;align-items:end;gap:6px;height:42px;margin-bottom:22px}.mark i{width:9px;border-radius:8px;background:linear-gradient(var(--cyan),#12bad9);box-shadow:0 0 24px rgba(87,228,255,.35)}.mark i:nth-child(1){height:22px}.mark i:nth-child(2){height:42px}.mark i:nth-child(3){height:30px}
+    .placeholder p{margin-bottom:7px;font-size:clamp(1.05rem,2vw,1.4rem);font-weight:750}.placeholder small{color:var(--muted)}
+    .header-actions,.actions{display:flex;align-items:center;justify-content:flex-end;gap:7px}.header-actions{flex-wrap:wrap}.tool{min-height:36px;padding:0 12px;border:1px solid rgba(255,255,255,.12);border-radius:9px;background:rgba(3,8,14,.72);backdrop-filter:blur(10px);cursor:pointer;font-size:.72rem}.tool:hover:not(:disabled){border-color:rgba(87,228,255,.5)}button:disabled{cursor:not-allowed;opacity:.42}
+    .grid{display:block;margin-top:16px}.panel{padding:24px}.heading{display:flex;align-items:start;justify-content:space-between;gap:18px;margin-bottom:24px}.heading>p{max-width:250px;margin:0;color:var(--muted);font-size:.78rem;line-height:1.6;text-align:right}
+    label{display:block;margin:15px 0 7px;color:#afbdd0;font-size:.74rem;font-weight:700}input,select{width:100%;min-height:46px;border:1px solid rgba(159,190,224,.19);border-radius:11px;outline:0;background:rgba(2,8,15,.56);color:var(--text);padding:0 13px}input:focus,select:focus{border-color:rgba(87,228,255,.72);box-shadow:0 0 0 3px rgba(87,228,255,.09)}input::placeholder{color:#5e7187}.url-row{display:grid;grid-template-columns:1fr auto;gap:8px}
+    .paste,.connect{border:0;border-radius:11px;cursor:pointer;font-weight:800}.paste{padding:0 16px;background:#1a2b3e;color:#cfe0f0}.connect{display:flex;align-items:center;justify-content:space-between;width:100%;min-height:52px;margin-top:18px;padding:0 18px;background:linear-gradient(120deg,#3ed9f5,#6ae8dd);color:#041017;box-shadow:0 10px 30px rgba(36,201,229,.18)}.connect[data-action=disconnect]{background:linear-gradient(120deg,#ff8f94,#ffc2a6)}.arrow{font-size:1.35rem}.error{min-height:1.25em;margin:7px 0 0;color:var(--danger);font-size:.76rem}
+    .controller-label{display:flex;align-items:flex-end;justify-content:space-between}.controller-label .pulse{margin:0 6px 11px 0}.note{margin:10px 0 0;color:var(--muted);font-size:.74rem;line-height:1.55}
+    .metrics{display:grid;grid-template-columns:repeat(6,1fr);margin-top:16px;overflow:hidden}.metric{min-height:118px;padding:20px}.metric+.metric{border-left:1px solid var(--line)}.metric span,.metric small{display:block;color:var(--muted);font-size:.65rem;font-weight:700;letter-spacing:.08em}.metric strong{display:block;margin:10px 0 4px;color:var(--cyan);font-size:clamp(1.05rem,1.8vw,1.55rem);font-variant-numeric:tabular-nums}
+    details{margin-top:16px;padding:18px 22px;box-shadow:none}summary{cursor:pointer;font-weight:750}details ol{margin:16px 0 4px;padding-left:22px;color:var(--muted);font-size:.83rem;line-height:1.8}code{color:var(--cyan)}footer{display:flex;justify-content:space-between;padding:22px 4px 0;color:#5f7388;font-size:.68rem;letter-spacing:.08em}
+    @media(max-width:800px){.shell{width:min(100% - 24px,680px);padding-top:22px}header{align-items:start}.metrics{grid-template-columns:repeat(2,1fr)}.metric:nth-child(odd){border-left:0}.metric:nth-child(n+3){border-top:1px solid var(--line)}}
+    @media(max-width:520px){header{display:block}.header-actions{justify-content:flex-start;margin-top:16px}.actions{order:2;flex-wrap:wrap;justify-content:flex-start}.badge{order:1}.panel{padding:20px}.heading{display:block}.heading>p{margin-top:10px;text-align:left}.url-row{grid-template-columns:1fr}.paste{min-height:42px}.stage{aspect-ratio:16/10}.tool{padding:0 9px;font-size:.66rem}footer{display:grid;gap:7px}}
+    @media(prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+  </style>
 </head>
 <body>
-  <h1>WebRTC Guest (Screen Capture)</h1>
-  <div class="input-row">
-    <label>名前:
-      <input id="guest-name" placeholder="ゲスト名を入力" size="24">
-    </label>
-  </div>
-    <div class="input-row">
-    <label for="gamepad-select">ゲームパッド:</label>
-    <select id="gamepad-select"></select>
-    <button id="refresh-gamepads-btn" type="button">更新</button>
-  </div>
-  <div class="input-row">
-    <label>WebSocket URL:
-      <input id="ws-url" value="ws://127.0.0.1:8080/ws" size="40">
-    </label>
-    <button id="connect-btn">接続</button>
-  </div>
+  <main class="shell">
+    <header>
+      <div><p class="eyebrow">REMOTEPLAY / WEB GUEST</p></div>
+      <div class="header-actions">
+        <div class="actions"><button id="audio" class="tool" disabled>音声 ON</button><button id="resync" class="tool" disabled>映像を再同期</button><button id="fullscreen" class="tool" disabled>全画面</button></div>
+        <div id="badge" class="badge" data-state="idle"><span class="dot"></span><span id="badgeText">未接続</span></div>
+      </div>
+    </header>
 
-  <div class="input-row">
-    <label>ビデオバッファ (フレーム):
-      <input id="video-buffer-frames" type="number" min="1" step="1" value="4" size="4">
-    </label>
-    <span class="hint">低遅延重視なら 1–2 が目安</span>
-  </div>
+    <section class="card" aria-label="リモート映像">
+      <div id="stage" class="stage">
+        <video id="video" autoplay playsinline></video>
+        <div class="placeholder"><div class="mark"><i></i><i></i><i></i></div><p id="stageTitle">ホストに接続してください</p><small id="stageDetail">ホスト画面の公開接続URLを貼り付けてください</small></div>
+      </div>
+    </section>
 
-  <h2>映像</h2>
-  <video id="video" autoplay playsinline controls></video>
+    <section class="grid">
+      <article class="panel">
+        <div class="heading"><div><h2>接続</h2></div><p>Rustホストが表示したURLを使用します</p></div>
+        <form id="form" novalidate>
+          <label for="name">ゲスト名</label><input id="name" maxlength="32" autocomplete="nickname" placeholder="ゲスト">
+          <div class="controller-label"><label for="gamepad">使用するコントローラー</label><span id="inputPulse" class="pulse" title="入力状態"></span></div>
+          <select id="gamepad"><option value="">ゲームパッド未検出（映像のみ接続可能）</option></select>
+          <p id="gamepadHelp" class="note">コントローラーのボタンを一度押すと、ブラウザが検出します。</p>
+          <label for="url">公開接続URL</label>
+          <div class="url-row"><input id="url" type="url" inputmode="url" spellcheck="false" placeholder="wss://example.trycloudflare.com/ws" required><button id="paste" class="paste" type="button">貼り付け</button></div>
+          <p id="error" class="error" role="alert"></p>
+          <button id="connect" class="connect" type="submit"><span id="connectText">ホストへ接続</span><span class="arrow">→</span></button>
+        </form>
+      </article>
+    </section>
 
-  <h2>ログ</h2>
-  <div class="input-row">
-    <button id="clear-log-btn" type="button">ログ削除</button>
-    <button id="save-log-btn" type="button">TXT書き出し</button>
-  </div>
-  <pre id="log"></pre>
+    <section class="metrics" aria-label="接続統計">
+      <div class="metric"><span>解像度</span><strong id="resolution">-- × --</strong><small>VIDEO</small></div>
+      <div class="metric"><span>フレームレート</span><strong id="fps">--</strong><small>FPS</small></div>
+      <div class="metric"><span>往復時間</span><strong id="rtt">--</strong><small>RTT</small></div>
+      <div class="metric"><span>受信バッファ</span><strong id="buffer">--</strong><small>JITTER</small></div>
+      <div class="metric"><span>パケット損失</span><strong id="loss">--</strong><small>PACKETS</small></div>
+          <div class="metric"><span>総映像遅延</span><strong id="display">--</strong><small>CAPTURE → DISPLAY</small></div>
+    </section>
 
-  <script src="app.js"></script>
+    <footer><span>RemotePlay Web Guest</span><span>WebRTC / H.264 / Opus</span></footer>
+  </main>
+
+  <script>
+    "use strict";
+    const $=id=>document.getElementById(id),E={form:$("form"),name:$("name"),url:$("url"),error:$("error"),connect:$("connect"),connectText:$("connectText"),paste:$("paste"),badge:$("badge"),badgeText:$("badgeText"),video:$("video"),stage:$("stage"),stageTitle:$("stageTitle"),stageDetail:$("stageDetail"),audio:$("audio"),resync:$("resync"),fullscreen:$("fullscreen"),gamepad:$("gamepad"),gamepadHelp:$("gamepadHelp"),inputPulse:$("inputPulse"),rtt:$("rtt"),buffer:$("buffer"),fps:$("fps"),loss:$("loss"),display:$("display"),resolution:$("resolution")};
+    const S={generation:0,ws:null,pc:null,dc:null,stream:null,candidates:[],connected:false,manual:false,videoStarted:false,frameId:null,connectTimer:null,statsTimer:null,syncTimer:null,padTimer:null,padIndex:null,lastPad:"",lastPadAt:0,lastInputAt:0,previousInbound:null};
+    const URL_KEY="remoteplay.webGuest.url",NAME_KEY="remoteplay.webGuest.name";
+
+    function status(state,label,title,detail){E.badge.dataset.state=state;E.badgeText.textContent=label;if(title)E.stageTitle.textContent=title;if(detail)E.stageDetail.textContent=detail}
+    function controls(active){E.connect.dataset.action=active?"disconnect":"connect";E.connectText.textContent=active?"切断する":"ホストへ接続";E.name.disabled=active;E.url.disabled=active;E.paste.disabled=active;E.audio.disabled=!active;E.resync.disabled=!active;E.fullscreen.disabled=!active}
+    function normalize(raw){let value=raw.trim();if(!value)throw Error("公開接続URLを入力してください。");if(!/^[a-z][a-z\d+.-]*:\/\//i.test(value))value=`${location.protocol==="https:"?"wss":"ws"}://${value}`;const url=new URL(value);if(url.protocol==="https:")url.protocol="wss:";if(url.protocol==="http:")url.protocol="ws:";if(!["ws:","wss:"].includes(url.protocol))throw Error("URLは wss:// または ws:// で入力してください。");if(location.protocol==="https:"&&url.protocol==="ws:")throw Error("GitHub Pagesではwss://の公開接続URLが必要です。");if(!url.pathname||url.pathname==="/")url.pathname="/ws";url.hash="";return url.toString()}
+    function signal(data){if(S.ws?.readyState===WebSocket.OPEN){S.ws.send(JSON.stringify(data));return true}return false}
+    function data(data){if(S.dc?.readyState!=="open"||S.dc.bufferedAmount>262144)return false;S.dc.send(JSON.stringify(data));return true}
+    function keyframe(reason){data({type:"keyframe_request",reason})}
+    function receiverLowLatency(receiver){try{if("jitterBufferTarget"in receiver)receiver.jitterBufferTarget=0;if("playoutDelayHint"in receiver)receiver.playoutDelayHint=0}catch(error){console.warn("Low latency hint rejected",error)}}
+    function h264First(transceiver){try{const codecs=RTCRtpReceiver.getCapabilities?.("video")?.codecs?.filter(c=>c.mimeType.toLowerCase()==="video/h264");if(codecs?.length&&transceiver.setCodecPreferences)transceiver.setCodecPreferences(codecs)}catch(error){console.warn("H264 preference rejected",error)}}
+
+    async function makePeer(generation){
+      const pc=new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}],bundlePolicy:"max-bundle",rtcpMuxPolicy:"require"});S.pc=pc;S.stream=new MediaStream;E.video.srcObject=S.stream;
+      pc.onicecandidate=({candidate})=>{if(candidate&&generation===S.generation)signal({type:"candidate",candidate:candidate.toJSON()})};
+      pc.ontrack=({track,receiver})=>{if(generation!==S.generation)return;receiverLowLatency(receiver);if(!S.stream.getTracks().some(t=>t.id===track.id))S.stream.addTrack(track);E.video.play().catch(autoplay);if(track.kind==="video")monitorFrames(generation)};
+      pc.onconnectionstatechange=()=>{if(generation!==S.generation)return;switch(pc.connectionState){case"connected":clearTimeout(S.connectTimer);S.connected=true;controls(true);status("connected","接続済み","映像を受信しています","WebRTC接続が確立しました");pc.getReceivers().forEach(receiverLowLatency);startStats();break;case"connecting":status("connecting","接続中","映像経路を確立しています","ICE接続を確認しています");break;case"failed":fail("WebRTC接続に失敗しました。URLとネットワークを確認してください。");break;case"disconnected":status("connecting","再接続中","通信が一時中断しました","ネットワークの復帰を待っています");break;case"closed":if(!S.manual)disconnected("接続が終了しました")}};
+      const dc=pc.createDataChannel("input",{ordered:false,maxPacketLifeTime:50});setupDataChannel(dc,generation);
+      const video=pc.addTransceiver("video",{direction:"recvonly"});h264First(video);pc.addTransceiver("audio",{direction:"recvonly"});
+      await pc.setLocalDescription(await pc.createOffer());if(generation===S.generation)signal({type:"offer",sdp:pc.localDescription.sdp});
+    }
+
+    function setupDataChannel(dc,generation){S.dc=dc;dc.binaryType="arraybuffer";dc.bufferedAmountLowThreshold=32768;
+      dc.onopen=()=>{if(generation!==S.generation)return;keyframe("browser_data_channel_open");let tries=0;clearInterval(S.syncTimer);S.syncTimer=setInterval(()=>{if(S.videoStarted||tries++>=8){clearInterval(S.syncTimer);return}keyframe("browser_waiting_for_video")},500);startPadPolling()};
+      dc.onmessage=async event=>{try{const text=typeof event.data==="string"?event.data:event.data instanceof Blob?await event.data.text():new TextDecoder().decode(event.data);const message=JSON.parse(text);if(message.type==="ping"&&Number.isFinite(message.sent_at))data({type:"pong",sent_at:message.sent_at})}catch(error){console.warn("Unknown data message",error)}};
+      dc.onclose=()=>{if(generation===S.generation&&!S.manual)fail("入力チャンネルが切断されました。")} }
+
+    async function onSignal(raw,generation){let message;try{message=JSON.parse(raw)}catch{return}if(generation!==S.generation)return;
+      if(message.type==="answer"){await S.pc.setRemoteDescription({type:"answer",sdp:message.sdp});for(const c of S.candidates.splice(0))await S.pc.addIceCandidate(c)}
+      else if(message.type==="candidate"&&message.candidate){if(S.pc.remoteDescription)await S.pc.addIceCandidate(message.candidate);else S.candidates.push(message.candidate)}
+      else if(message.type==="disconnect")await stop(false,message.reason||"ホストから切断されました");
+    }
+
+    async function start(){E.error.textContent="";let url;try{url=normalize(E.url.value)}catch(error){E.error.textContent=error.message;return}await stop(false);const generation=++S.generation;S.manual=false;S.videoStarted=false;S.candidates=[];E.stage.classList.remove("has-video");controls(true);status("connecting","接続中","ホストへ接続しています","WebSocketシグナリングを開始しています");
+      const name=E.name.value.trim()||"ブラウザゲスト";E.url.value=url;localStorage.setItem(URL_KEY,url);localStorage.setItem(NAME_KEY,name);
+      try{S.ws=new WebSocket(url)}catch(error){fail(error.message);return}S.connectTimer=setTimeout(()=>{if(generation===S.generation&&!S.connected)fail("接続がタイムアウトしました。ホストで配信を開始してください。")},20000);
+      S.ws.onopen=async()=>{if(generation!==S.generation)return;try{signal({type:"name",name});await makePeer(generation)}catch(error){fail(`接続準備に失敗しました: ${error.message}`)}};
+      S.ws.onmessage=({data})=>onSignal(data,generation).catch(error=>fail(`シグナリング処理に失敗しました: ${error.message}`));S.ws.onerror=()=>{if(!S.connected)E.error.textContent="WebSocketへ接続できませんでした。URLを確認してください。"};S.ws.onclose=()=>{if(generation!==S.generation||S.manual)return;if(S.pc?.connectionState==="connected")status("connected","接続済み","映像を受信しています","映像接続は継続しています");else fail("ホストとの接続が終了しました。")} }
+
+    async function stop(notify=true,reason="切断しました"){S.manual=true;S.connected=false;S.generation++;clearTimeout(S.connectTimer);clearInterval(S.statsTimer);clearInterval(S.syncTimer);clearInterval(S.padTimer);if(notify)signal({type:"disconnect",reason:"Browser guest disconnected"});sendPadDisconnected();if(S.dc){S.dc.onclose=null;S.dc.close()}if(S.pc){S.pc.onconnectionstatechange=null;S.pc.close()}if(S.ws){S.ws.onclose=null;S.ws.close()}if(S.frameId!==null&&E.video.cancelVideoFrameCallback)E.video.cancelVideoFrameCallback(S.frameId);Object.assign(S,{ws:null,pc:null,dc:null,stream:null,candidates:[],frameId:null,videoStarted:false,previousInbound:null});E.video.pause();E.video.srcObject=null;E.stage.classList.remove("has-video");resetMetrics();disconnected(reason)}
+    function fail(message){E.error.textContent=message;stop(false,message);status("error","接続失敗","接続できませんでした",message)}
+    function disconnected(title){controls(false);status("idle","未接続",title,"ホスト画面の公開接続URLを貼り付けてください")}
+    function autoplay(error){console.warn("Autoplay blocked",error);E.error.textContent="映像をクリックすると再生を開始できます。"}
+    function resyncVideo(){S.pc?.getReceivers().forEach(receiverLowLatency);E.video.playbackRate=1;E.video.play().catch(autoplay);if(!S.videoStarted)keyframe("browser_manual_start")}
+
+    function monitorFrames(generation){if(!E.video.requestVideoFrameCallback||S.frameId!==null)return;const frame=(_now,m)=>{if(generation!==S.generation)return;S.videoStarted=true;E.stage.classList.add("has-video");E.resolution.textContent=`${m.width||E.video.videoWidth} × ${m.height||E.video.videoHeight}`;const origin=Number.isFinite(m.captureTime)?m.captureTime:m.receiveTime;if(Number.isFinite(origin)&&Number.isFinite(m.expectedDisplayTime))E.display.textContent=`${Math.round(Math.max(0,m.expectedDisplayTime-origin))} ms`;S.frameId=E.video.requestVideoFrameCallback(frame)};S.frameId=E.video.requestVideoFrameCallback(frame)}
+    function startStats(){clearInterval(S.statsTimer);stats();S.statsTimer=setInterval(stats,1000)}
+    async function stats(){if(!S.pc||S.pc.connectionState==="closed")return;try{S.pc.getReceivers().forEach(receiverLowLatency);const reports=await S.pc.getStats();let inbound,pair;reports.forEach(r=>{if(r.type==="inbound-rtp"&&r.kind==="video"&&!r.isRemote)inbound=r;if(r.type==="candidate-pair"&&r.state==="succeeded"&&(r.nominated||r.selected))pair=r});if(Number.isFinite(pair?.currentRoundTripTime)){const ms=pair.currentRoundTripTime*1000;E.rtt.textContent=ms>0&&ms<1?"<1 ms":`${Math.round(ms)} ms`}if(inbound){E.loss.textContent=String(inbound.packetsLost||0);if(S.previousInbound){const elapsed=(inbound.timestamp-S.previousInbound.timestamp)/1000,decoded=(inbound.framesDecoded||0)-S.previousInbound.decoded,count=(inbound.jitterBufferEmittedCount||0)-S.previousInbound.count,delay=(inbound.jitterBufferDelay||0)-S.previousInbound.delay;if(elapsed>0&&decoded>=0)E.fps.textContent=`${Math.round(decoded/elapsed)} fps`;if(count>0&&delay>=0)E.buffer.textContent=`${Math.round(delay/count*1000)} ms`}else if(Number.isFinite(inbound.framesPerSecond))E.fps.textContent=`${Math.round(inbound.framesPerSecond)} fps`;S.previousInbound={timestamp:inbound.timestamp,decoded:inbound.framesDecoded||0,count:inbound.jitterBufferEmittedCount||0,delay:inbound.jitterBufferDelay||0}}}catch(error){console.warn("Stats failed",error)}}
+    function resetMetrics(){[E.rtt,E.buffer,E.fps,E.loss,E.display].forEach(e=>e.textContent="--");E.resolution.textContent="-- × --"}
+
+    function refreshPads(){const pads=Array.from(navigator.getGamepads?.()||[]).filter(Boolean),old=S.padIndex;E.gamepad.replaceChildren();if(!pads.length){E.gamepad.add(new Option("ゲームパッド未検出（映像のみ接続可能）",""));S.padIndex=null;E.gamepadHelp.textContent="コントローラーのボタンを一度押すと、ブラウザが検出します。";return}pads.forEach(p=>E.gamepad.add(new Option(`#${p.index+1} ${p.id}`,String(p.index))));S.padIndex=pads.some(p=>p.index===old)?old:pads[0].index;E.gamepad.value=String(S.padIndex);E.gamepadHelp.textContent=`${pads.length}台検出 / 入力は低遅延チャンネルで送信されます。`}
+    function padPayload(pad,connected=true){return{type:"gamepad",gamepad:{id:pad?.id||"Browser Gamepad",connected,mapping:pad?.mapping||"standard",buttons:Array.from(pad?.buttons||[],b=>({pressed:b.pressed,value:Math.round(b.value*1000)/1000})),axes:Array.from(pad?.axes||[]).slice(0,4).map(v=>Math.round(v*1000)/1000)}}}
+    function startPadPolling(){clearInterval(S.padTimer);S.lastPad="";S.lastPadAt=0;S.padTimer=setInterval(pollPad,4)}
+    function pollPad(){if(S.dc?.readyState!=="open"||S.padIndex===null)return inputPulse();const pad=navigator.getGamepads?.()[S.padIndex];if(!pad)return;const payload=padPayload(pad),snapshot=JSON.stringify(payload.gamepad),now=performance.now();if(snapshot!==S.lastPad||now-S.lastPadAt>=100){if(data(payload)){S.lastPad=snapshot;S.lastPadAt=now}}if(pad.buttons.some(b=>b.pressed||b.value>.1)||pad.axes.some(a=>Math.abs(a)>.12))S.lastInputAt=now;inputPulse()}
+    function inputPulse(){E.inputPulse.classList.toggle("active",performance.now()-S.lastInputAt<180)}function sendPadDisconnected(){if(S.dc?.readyState!=="open")return;const pad=S.padIndex===null?null:navigator.getGamepads?.()[S.padIndex];data(padPayload(pad,false))}
+
+    E.form.addEventListener("submit",event=>{event.preventDefault();if(S.connected||S.ws||S.pc)stop(true);else start()});E.paste.addEventListener("click",async()=>{try{E.url.value=(await navigator.clipboard.readText()).trim();E.error.textContent=""}catch{E.error.textContent="クリップボードを読めませんでした。URL欄へ直接貼り付けてください。"}});E.gamepad.addEventListener("change",()=>{S.padIndex=E.gamepad.value===""?null:Number(E.gamepad.value);S.lastPad=""});
+    E.audio.addEventListener("click",()=>{E.video.muted=!E.video.muted;E.audio.textContent=E.video.muted?"音声 OFF":"音声 ON";if(!E.video.muted)E.video.play().catch(autoplay)});E.resync.addEventListener("click",resyncVideo);E.fullscreen.addEventListener("click",()=>document.fullscreenElement?document.exitFullscreen():E.stage.requestFullscreen?.());E.video.addEventListener("click",()=>E.video.play().catch(autoplay));E.video.addEventListener("pause",()=>{if(S.connected)E.video.play().catch(autoplay)});
+    window.addEventListener("gamepadconnected",refreshPads);window.addEventListener("gamepaddisconnected",()=>{sendPadDisconnected();refreshPads()});window.addEventListener("beforeunload",()=>{signal({type:"disconnect",reason:"Browser page closed"});sendPadDisconnected()});document.addEventListener("visibilitychange",()=>{if(!document.hidden&&S.connected)keyframe("browser_became_visible")});
+    const query=new URLSearchParams(location.search).get("host");E.url.value=query||localStorage.getItem(URL_KEY)||"";E.name.value=localStorage.getItem(NAME_KEY)||"ブラウザゲスト";refreshPads();setInterval(refreshPads,1500);resetMetrics();disconnected("ホストに接続してください");
+  </script>
 </body>
 </html>
