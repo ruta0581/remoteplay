@@ -99,7 +99,7 @@
     function signal(data){if(S.ws?.readyState===WebSocket.OPEN){S.ws.send(JSON.stringify(data));return true}return false}
     function data(data){if(S.dc?.readyState!=="open"||S.dc.bufferedAmount>262144)return false;S.dc.send(JSON.stringify(data));return true}
     function keyframe(reason){data({type:"keyframe_request",reason})}
-    function receiverLowLatency(receiver){try{if("jitterBufferTarget"in receiver)receiver.jitterBufferTarget=0;if("playoutDelayHint"in receiver)receiver.playoutDelayHint=0}catch(error){console.warn("Low latency hint rejected",error)}}
+    function receiverLowLatency(receiver){try{if("jitterBufferTarget"in receiver)receiver.jitterBufferTarget=0;else if("playoutDelayHint"in receiver)receiver.playoutDelayHint=0}catch(error){console.warn("Low latency hint rejected",error)}}
     function h264First(transceiver){try{const codecs=RTCRtpReceiver.getCapabilities?.("video")?.codecs?.filter(c=>c.mimeType.toLowerCase()==="video/h264");if(codecs?.length&&transceiver.setCodecPreferences)transceiver.setCodecPreferences(codecs)}catch(error){console.warn("H264 preference rejected",error)}}
 
     async function makePeer(generation){
