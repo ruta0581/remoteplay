@@ -214,6 +214,83 @@ function preferH264(transceiver) {
   }
 }
 
+function preferOpus(transceiver) {
+  // The Host always sends already-encoded Opus. A normal browser audio offer
+  // also advertises RED/PCMU/PCMA/G722/etc.; leaving those codecs enabled can
+  // make a non-Opus payload type become the sender's first negotiated codec on
+  // some browser/WebRTC combinations. The bytes are still Opus in that case,
+  // which the browser then decodes as another codec and it is heard as noise.
+  // Restrict the receive transceiver to Opus/48 kHz/2 ch before createOffer.
+  try {
+    const codecs = RTCRtpReceiver.getCapabilities?.("audio")?.codecs || [];
+    const opus = codecs.filter((codec) =>
+      codec.mimeType.toLowerCase() === "audio/opus" &&
+      Number(codec.clockRate) === 48_000 &&
+      (!codec.channels || Number(codec.channels) === 2),
+    );
+    if (opus.length && transceiver.setCodecPreferences) {
+      transceiver.setCodecPreferences(opus);
+      return true;
+    }
+  } catch (error) {
+    console.warn("Opus codec preference was rejected", error);
+  }
+  return false;
+}
+
+function forceOpusAudioOffer(sdp) {
+  // Fallback for browsers where setCodecPreferences is absent/ignored. Keep
+  // only Opus payload types in the audio m-section so the Host cannot bind the
+  // encoded Opus track to PCMU/PCMA/RED by payload-type ordering.
+  const lines = String(sdp || "").split(/\r?\n/);
+  const audioStart = lines.findIndex((line) => line.startsWith("m=audio "));
+  if (audioStart < 0) return sdp;
+  let audioEnd = lines.length;
+  for (let i = audioStart + 1; i < lines.length; i += 1) {
+    if (lines[i].startsWith("m=")) {
+      audioEnd = i;
+      break;
+    }
+  }
+
+  const opusPayloads = new Set();
+  for (let i = audioStart + 1; i < audioEnd; i += 1) {
+    const match = lines[i].match(/^a=rtpmap:(\d+)\s+opus\/48000(?:\/2)?$/i);
+    if (match) opusPayloads.add(match[1]);
+  }
+  if (!opusPayloads.size) return sdp;
+
+  const m = lines[audioStart].trim().split(/\s+/);
+  if (m.length >= 4) {
+    lines[audioStart] = [...m.slice(0, 3), ...opusPayloads].join(" ");
+  }
+
+  const payloadAttribute = /^a=(?:rtpmap|fmtp|rtcp-fb):(\d+)\b/i;
+  const filtered = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (i > audioStart && i < audioEnd) {
+      const match = lines[i].match(payloadAttribute);
+      if (match && match[1] !== "*" && !opusPayloads.has(match[1])) continue;
+      if (/^a=fmtp:(\d+)\s+/i.test(lines[i])) {
+        const pt = lines[i].match(/^a=fmtp:(\d+)\s+/i)?.[1];
+        if (pt && opusPayloads.has(pt)) {
+          // Explicitly request stereo Opus and in-band FEC. Preserve any
+          // browser-provided parameters while avoiding duplicate keys.
+          const [prefix, params = ""] = lines[i].split(/\s+/, 2);
+          const entries = params.split(";").map((v) => v.trim()).filter(Boolean);
+          const keys = new Set(entries.map((v) => v.split("=", 1)[0].toLowerCase()));
+          if (!keys.has("stereo")) entries.push("stereo=1");
+          if (!keys.has("sprop-stereo")) entries.push("sprop-stereo=1");
+          if (!keys.has("useinbandfec")) entries.push("useinbandfec=1");
+          lines[i] = `${prefix} ${entries.join(";")}`;
+        }
+      }
+    }
+    filtered.push(lines[i]);
+  }
+  return filtered.join("\r\n");
+}
+
 function iceServersForMode(mode) {
   if (mode === "ipv6_direct") return [];
   return [
@@ -278,10 +355,18 @@ async function createPeer(generation, networkMode) {
 
     const video = peer.addTransceiver("video", { direction: "recvonly" });
     preferH264(video);
-    peer.addTransceiver("audio", { direction: "recvonly" });
+    const audio = peer.addTransceiver("audio", { direction: "recvonly" });
+    const opusPreferenceApplied = preferOpus(audio);
 
     const offer = await peer.createOffer();
-    await peer.setLocalDescription(offer);
+    const opusOnlyOffer = {
+      type: offer.type,
+      sdp: forceOpusAudioOffer(offer.sdp),
+    };
+    await peer.setLocalDescription(opusOnlyOffer);
+    console.info(
+      `Web audio codec locked to Opus/48000/2 (codecPreferences=${opusPreferenceApplied ? "yes" : "fallback-sdp"})`,
+    );
     if (generation === state.generation) {
       sendSignal({ type: "offer", sdp: peer.localDescription.sdp });
     }
