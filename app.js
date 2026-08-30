@@ -2,6 +2,7 @@
 
 const CONNECTION_TIMEOUT_MS = 45_000;
 const WELCOME_TIMEOUT_MS = 10_000;
+const AUDIO_JITTER_TARGET_MS = 20;
 const RECONNECT_GRACE_MS = 5_000;
 const NETWORK_FEEDBACK_INTERVAL_MS = 2_000;
 const MAX_INPUT_BUFFER_BYTES = 64 * 1024;
@@ -168,7 +169,23 @@ function requestSyncFrame(reason) {
   return sendInput({ type: "sync_frame", reason });
 }
 
-function setReceiverLowLatency(receiver) {
+function configureReceiverLatency(receiver) {
+  // Audio cannot use the video path's zero-buffer policy. A zero target makes
+  // the browser's audio renderer underrun on ordinary packet/scheduler jitter,
+  // which is heard as continuous crackle or noise. Match the Rust guest's
+  // initial 20 ms Opus cushion while still allowing the browser to grow the
+  // buffer when the network needs it.
+  if (receiver.track?.kind === "audio") {
+    try {
+      if ("jitterBufferTarget" in receiver) {
+        receiver.jitterBufferTarget = AUDIO_JITTER_TARGET_MS;
+      }
+    } catch (error) {
+      console.debug(`audio jitterBufferTarget=${AUDIO_JITTER_TARGET_MS} was rejected`, error);
+    }
+    return;
+  }
+
   try {
     if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = 0;
   } catch (error) {
@@ -234,7 +251,7 @@ async function createPeer(generation, networkMode) {
 
     peer.ontrack = ({ track, receiver }) => {
       if (generation !== state.generation) return;
-      setReceiverLowLatency(receiver);
+      configureReceiverLatency(receiver);
       if (track.kind === "video") {
         addTrackOnce(state.videoStream, track);
         element.video.play().catch(onVideoAutoplayBlocked);
@@ -288,7 +305,7 @@ function handlePeerState(generation, peer) {
       state.connected = true;
       setControls(true);
       setStatus("connected", "接続済み", "映像を受信しています", "WebRTC接続が確立しました");
-      peer.getReceivers().forEach(setReceiverLowLatency);
+      peer.getReceivers().forEach(configureReceiverLatency);
       startStats();
       break;
     case "connecting":
@@ -610,7 +627,7 @@ function onAudioAutoplayBlocked(error) {
 }
 
 function resyncVideo() {
-  state.peer?.getReceivers().forEach(setReceiverLowLatency);
+  state.peer?.getReceivers().forEach(configureReceiverLatency);
   element.video.playbackRate = 1;
   element.video.play().catch(onVideoAutoplayBlocked);
   requestSyncFrame("browser_manual_start");
