@@ -3,12 +3,8 @@
 const CONNECTION_TIMEOUT_MS = 45_000;
 const WELCOME_TIMEOUT_MS = 10_000;
 const AUDIO_JITTER_TARGET_MS = 20;
-const AUDIO_CATCHUP_TRIGGER_MS = 120;
-const AUDIO_CATCHUP_RELEASE_MS = 55;
-const VIDEO_BUFFER_FLUSH_TRIGGER_MS = 120;
-const VIDEO_BUFFER_FLUSH_EXTRA_MS = 45;
-const VIDEO_BUFFER_FLUSH_HITS = 2;
-const VIDEO_BUFFER_FLUSH_COOLDOWN_MS = 2_000;
+const VIDEO_JITTER_TARGET_MS = 16;
+const VIDEO_PLAYOUT_DELAY_SECONDS = 0.016;
 const RECONNECT_GRACE_MS = 5_000;
 const NETWORK_FEEDBACK_INTERVAL_MS = 2_000;
 const MAX_INPUT_BUFFER_BYTES = 64 * 1024;
@@ -75,6 +71,7 @@ const state = {
   peerStarting: false,
   videoStarted: false,
   lastVideoFrameAt: 0,
+  lastDecodedFrameAt: 0,
   lastStallRequestAt: 0,
   frameCallbackId: null,
   connectionTimer: null,
@@ -95,15 +92,6 @@ const state = {
   previousFeedback: null,
   nextFeedbackAt: 0,
   measuredRttMs: null,
-  audioContext: null,
-  audioSource: null,
-  audioGain: null,
-  audioMuted: false,
-  audioCatchup: false,
-  previousJitterStats: { audio: null, video: null },
-  videoBufferHighHits: 0,
-  lastVideoLatencyFlushAt: 0,
-  videoDisplayDelayMs: null,
   mobile: false,
   virtualButtons: new Array(16).fill(0),
   virtualCounts: new Array(16).fill(0),
@@ -185,83 +173,34 @@ function requestSyncFrame(reason) {
 }
 
 function configureReceiverLatency(receiver) {
-  const kind = receiver.track?.kind;
-  const targetMs = kind === "audio" && !state.audioCatchup ? AUDIO_JITTER_TARGET_MS : 0;
-  try {
-    if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = targetMs;
-  } catch (error) {
-    console.debug(`${kind || "media"} jitterBufferTarget=${targetMs} was rejected`, error);
-  }
-  // Chromium exposes this older hint in seconds. Zero asks for the minimum
-  // available playout delay and is intentionally used for both tracks.
-  try {
-    if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = 0;
-  } catch (error) {
-    console.debug(`${kind || "media"} playoutDelayHint=0 was rejected`, error);
-  }
-}
-
-function audioReceiver() {
-  return state.peer?.getReceivers().find((receiver) => receiver.track?.kind === "audio") || null;
-}
-
-function videoReceiver() {
-  return state.peer?.getReceivers().find((receiver) => receiver.track?.kind === "video") || null;
-}
-
-async function ensureLowLatencyAudioOutput() {
-  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  if (!AudioContextClass) return false;
-  if (!state.audioContext || state.audioContext.state === "closed") {
+  // Audio cannot use the video path's zero-buffer policy. A zero target makes
+  // the browser's audio renderer underrun on ordinary packet/scheduler jitter,
+  // which is heard as continuous crackle or noise. Match the Rust guest's
+  // initial 20 ms Opus cushion while still allowing the browser to grow the
+  // buffer when the network needs it.
+  if (receiver.track?.kind === "audio") {
     try {
-      state.audioContext = new AudioContextClass({ latencyHint: "interactive", sampleRate: 48_000 });
-      state.audioGain = state.audioContext.createGain();
-      state.audioGain.gain.value = state.audioMuted ? 0 : 1;
-      state.audioGain.connect(state.audioContext.destination);
-      console.info(
-        `low-latency WebAudio output enabled baseLatencyMs=${Math.round((state.audioContext.baseLatency || 0) * 1000)}`,
-      );
+      if ("jitterBufferTarget" in receiver) {
+        receiver.jitterBufferTarget = AUDIO_JITTER_TARGET_MS;
+      }
     } catch (error) {
-      console.warn("low-latency WebAudio output could not be created", error);
-      state.audioContext = null;
-      state.audioGain = null;
-      return false;
+      console.debug(`audio jitterBufferTarget=${AUDIO_JITTER_TARGET_MS} was rejected`, error);
     }
-  }
-  if (state.audioContext.state === "suspended") {
-    try { await state.audioContext.resume(); } catch (error) {
-      console.debug("AudioContext resume was blocked", error);
-    }
-  }
-  return true;
-}
-
-async function attachLowLatencyAudioStream() {
-  if (!state.audioStream?.getAudioTracks().length) return;
-  if (!(await ensureLowLatencyAudioOutput()) || !state.audioGain) {
-    element.audioOut.srcObject = state.audioStream;
-    element.audioOut.muted = state.audioMuted;
-    if (!state.audioMuted) element.audioOut.play().catch(onAudioAutoplayBlocked);
     return;
   }
-  try { state.audioSource?.disconnect(); } catch { /* already disconnected */ }
-  state.audioSource = state.audioContext.createMediaStreamSource(state.audioStream);
-  state.audioSource.connect(state.audioGain);
-  element.audioOut.pause();
-  element.audioOut.srcObject = null;
-}
 
-function setAudioMuted(muted) {
-  state.audioMuted = Boolean(muted);
-  if (state.audioGain) state.audioGain.gain.value = state.audioMuted ? 0 : 1;
-  element.audioOut.muted = state.audioMuted;
-  element.audio.textContent = state.audioMuted ? "音声 OFF" : "音声 ON";
-  if (!state.audioMuted) {
-    void ensureLowLatencyAudioOutput();
-    if (!state.audioContext && state.audioStream) {
-      element.audioOut.srcObject = state.audioStream;
-      element.audioOut.play().catch(onAudioAutoplayBlocked);
-    }
+  // Keep one frame of explicit cushion. A forced zero target makes Chromium
+  // repeatedly shrink and grow its implicit safety margin under ordinary
+  // packet/scheduler jitter, which feels like latency moving back and forth.
+  try {
+    if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = VIDEO_JITTER_TARGET_MS;
+  } catch (error) {
+    console.debug(`video jitterBufferTarget=${VIDEO_JITTER_TARGET_MS} was rejected`, error);
+  }
+  try {
+    if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = VIDEO_PLAYOUT_DELAY_SECONDS;
+  } catch (error) {
+    console.debug(`video playoutDelayHint=${VIDEO_PLAYOUT_DELAY_SECONDS} was rejected`, error);
   }
 }
 
@@ -279,83 +218,6 @@ function preferH264(transceiver) {
   } catch (error) {
     console.warn("H.264 codec preference was rejected", error);
   }
-}
-
-function preferOpus(transceiver) {
-  // The Host always sends already-encoded Opus. A normal browser audio offer
-  // also advertises RED/PCMU/PCMA/G722/etc.; leaving those codecs enabled can
-  // make a non-Opus payload type become the sender's first negotiated codec on
-  // some browser/WebRTC combinations. The bytes are still Opus in that case,
-  // which the browser then decodes as another codec and it is heard as noise.
-  // Restrict the receive transceiver to Opus/48 kHz/2 ch before createOffer.
-  try {
-    const codecs = RTCRtpReceiver.getCapabilities?.("audio")?.codecs || [];
-    const opus = codecs.filter((codec) =>
-      codec.mimeType.toLowerCase() === "audio/opus" &&
-      Number(codec.clockRate) === 48_000 &&
-      (!codec.channels || Number(codec.channels) === 2),
-    );
-    if (opus.length && transceiver.setCodecPreferences) {
-      transceiver.setCodecPreferences(opus);
-      return true;
-    }
-  } catch (error) {
-    console.warn("Opus codec preference was rejected", error);
-  }
-  return false;
-}
-
-function forceOpusAudioOffer(sdp) {
-  // Fallback for browsers where setCodecPreferences is absent/ignored. Keep
-  // only Opus payload types in the audio m-section so the Host cannot bind the
-  // encoded Opus track to PCMU/PCMA/RED by payload-type ordering.
-  const lines = String(sdp || "").split(/\r?\n/);
-  const audioStart = lines.findIndex((line) => line.startsWith("m=audio "));
-  if (audioStart < 0) return sdp;
-  let audioEnd = lines.length;
-  for (let i = audioStart + 1; i < lines.length; i += 1) {
-    if (lines[i].startsWith("m=")) {
-      audioEnd = i;
-      break;
-    }
-  }
-
-  const opusPayloads = new Set();
-  for (let i = audioStart + 1; i < audioEnd; i += 1) {
-    const match = lines[i].match(/^a=rtpmap:(\d+)\s+opus\/48000(?:\/2)?$/i);
-    if (match) opusPayloads.add(match[1]);
-  }
-  if (!opusPayloads.size) return sdp;
-
-  const m = lines[audioStart].trim().split(/\s+/);
-  if (m.length >= 4) {
-    lines[audioStart] = [...m.slice(0, 3), ...opusPayloads].join(" ");
-  }
-
-  const payloadAttribute = /^a=(?:rtpmap|fmtp|rtcp-fb):(\d+)\b/i;
-  const filtered = [];
-  for (let i = 0; i < lines.length; i += 1) {
-    if (i > audioStart && i < audioEnd) {
-      const match = lines[i].match(payloadAttribute);
-      if (match && match[1] !== "*" && !opusPayloads.has(match[1])) continue;
-      if (/^a=fmtp:(\d+)\s+/i.test(lines[i])) {
-        const pt = lines[i].match(/^a=fmtp:(\d+)\s+/i)?.[1];
-        if (pt && opusPayloads.has(pt)) {
-          // Explicitly request stereo Opus and in-band FEC. Preserve any
-          // browser-provided parameters while avoiding duplicate keys.
-          const [prefix, params = ""] = lines[i].split(/\s+/, 2);
-          const entries = params.split(";").map((v) => v.trim()).filter(Boolean);
-          const keys = new Set(entries.map((v) => v.split("=", 1)[0].toLowerCase()));
-          if (!keys.has("stereo")) entries.push("stereo=1");
-          if (!keys.has("sprop-stereo")) entries.push("sprop-stereo=1");
-          if (!keys.has("useinbandfec")) entries.push("useinbandfec=1");
-          lines[i] = `${prefix} ${entries.join(";")}`;
-        }
-      }
-    }
-    filtered.push(lines[i]);
-  }
-  return filtered.join("\r\n");
 }
 
 function iceServersForMode(mode) {
@@ -402,7 +264,9 @@ async function createPeer(generation, networkMode) {
         monitorVideoFrames(generation);
       } else if (track.kind === "audio") {
         addTrackOnce(state.audioStream, track);
-        void attachLowLatencyAudioStream();
+        if (!element.audioOut.muted) {
+          element.audioOut.play().catch(onAudioAutoplayBlocked);
+        }
       }
     };
 
@@ -420,18 +284,10 @@ async function createPeer(generation, networkMode) {
 
     const video = peer.addTransceiver("video", { direction: "recvonly" });
     preferH264(video);
-    const audio = peer.addTransceiver("audio", { direction: "recvonly" });
-    const opusPreferenceApplied = preferOpus(audio);
+    peer.addTransceiver("audio", { direction: "recvonly" });
 
     const offer = await peer.createOffer();
-    const opusOnlyOffer = {
-      type: offer.type,
-      sdp: forceOpusAudioOffer(offer.sdp),
-    };
-    await peer.setLocalDescription(opusOnlyOffer);
-    console.info(
-      `Web audio codec locked to Opus/48000/2 (codecPreferences=${opusPreferenceApplied ? "yes" : "fallback-sdp"})`,
-    );
+    await peer.setLocalDescription(offer);
     if (generation === state.generation) {
       sendSignal({ type: "offer", sdp: peer.localDescription.sdp });
     }
@@ -630,6 +486,7 @@ async function start() {
   state.remoteCandidates = [];
   state.videoStarted = false;
   state.lastVideoFrameAt = 0;
+  state.lastDecodedFrameAt = 0;
   state.lastStallRequestAt = 0;
   element.stage.classList.remove("has-video");
   setControls(true);
@@ -719,13 +576,6 @@ async function teardown(notify, showIdle, reason = "切断しました") {
   control?.close();
   peer?.close();
   websocket?.close();
-  try { state.audioSource?.disconnect(); } catch { /* already disconnected */ }
-  state.audioSource = null;
-  if (state.audioContext && state.audioContext.state !== "closed") {
-    try { await state.audioContext.close(); } catch { /* best effort */ }
-  }
-  state.audioContext = null;
-  state.audioGain = null;
 
   Object.assign(state, {
     websocket: null,
@@ -739,6 +589,7 @@ async function teardown(notify, showIdle, reason = "切断しました") {
     peerStarting: false,
     videoStarted: false,
     lastVideoFrameAt: 0,
+    lastDecodedFrameAt: 0,
     lastStallRequestAt: 0,
     frameCallbackId: null,
     connectionTimer: null,
@@ -754,12 +605,6 @@ async function teardown(notify, showIdle, reason = "切断しました") {
     previousFeedback: null,
     nextFeedbackAt: 0,
     measuredRttMs: null,
-    audioSource: null,
-    audioCatchup: false,
-    previousJitterStats: { audio: null, video: null },
-    videoBufferHighHits: 0,
-    lastVideoLatencyFlushAt: 0,
-    videoDisplayDelayMs: null,
   });
 
   resetVirtualPad();
@@ -784,22 +629,15 @@ function onVideoAutoplayBlocked(error) {
 
 function onAudioAutoplayBlocked(error) {
   console.warn("Audio autoplay was blocked", error);
-  setAudioMuted(true);
+  element.audioOut.muted = true;
+  element.audio.textContent = "音声 OFF";
   element.error.textContent = "音声を再生するには「音声 OFF」を一度押してください。";
 }
 
 function resyncVideo() {
-  state.audioCatchup = true;
   state.peer?.getReceivers().forEach(configureReceiverLatency);
-  setTimeout(() => {
-    if (!state.connected) return;
-    state.audioCatchup = false;
-    const receiver = audioReceiver();
-    if (receiver) configureReceiverLatency(receiver);
-  }, 500);
   element.video.playbackRate = 1;
   element.video.play().catch(onVideoAutoplayBlocked);
-  void ensureLowLatencyAudioOutput();
   requestSyncFrame("browser_manual_start");
 }
 
@@ -821,8 +659,7 @@ function monitorVideoFrames(generation) {
         ? metadata.captureTime
         : metadata.receiveTime;
       if (Number.isFinite(origin) && Number.isFinite(metadata.expectedDisplayTime)) {
-        state.videoDisplayDelayMs = Math.max(0, metadata.expectedDisplayTime - origin);
-        element.display.textContent = `${Math.round(state.videoDisplayDelayMs)} ms`;
+        element.display.textContent = `${Math.round(Math.max(0, metadata.expectedDisplayTime - origin))} ms`;
       }
     }
     state.frameCallbackId = element.video.requestVideoFrameCallback(onFrame);
@@ -842,14 +679,10 @@ async function updateStats() {
   try {
     const reports = await state.peer.getStats();
     let inbound;
-    let audioInbound;
     let pair;
     reports.forEach((report) => {
       if (report.type === "inbound-rtp" && report.kind === "video" && !report.isRemote) {
         inbound = report;
-      }
-      if (report.type === "inbound-rtp" && report.kind === "audio" && !report.isRemote) {
-        audioInbound = report;
       }
       if (
         report.type === "candidate-pair" &&
@@ -868,13 +701,10 @@ async function updateStats() {
       element.rtt.textContent = rttMs > 0 && rttMs < 1 ? "<1 ms" : `${Math.round(rttMs)} ms`;
     }
 
-    if (!inbound && !audioInbound) return;
-    if (inbound) {
-      element.loss.textContent = String(inbound.packetsLost || 0);
-      updateInboundMetrics(inbound);
-      sendNetworkFeedbackIfDue(inbound);
-    }
-    applyLowLatencyWatchdog(inbound, audioInbound);
+    if (!inbound) return;
+    element.loss.textContent = String(inbound.packetsLost || 0);
+    updateInboundMetrics(inbound);
+    sendNetworkFeedbackIfDue(inbound);
 
     const now = performance.now();
     if (
@@ -882,6 +712,7 @@ async function updateStats() {
       state.connected &&
       state.videoStarted &&
       now - state.lastVideoFrameAt >= VIDEO_STALL_MS &&
+      now - state.lastDecodedFrameAt >= VIDEO_STALL_MS &&
       now - state.lastStallRequestAt >= VIDEO_STALL_REQUEST_COOLDOWN_MS
     ) {
       state.lastStallRequestAt = now;
@@ -892,96 +723,12 @@ async function updateStats() {
   }
 }
 
-function intervalJitterStats(kind, inbound) {
-  if (!inbound) return null;
-  const current = {
-    emitted: inbound.jitterBufferEmittedCount || 0,
-    delay: inbound.jitterBufferDelay || 0,
-    target: inbound.jitterBufferTargetDelay,
-    minimum: inbound.jitterBufferMinimumDelay,
-  };
-  const previous = state.previousJitterStats[kind];
-  state.previousJitterStats[kind] = current;
-  if (!previous) return null;
-  const emitted = current.emitted - previous.emitted;
-  if (!(emitted > 0)) return null;
-  const deltaMs = (value, before) =>
-    Number.isFinite(value) && Number.isFinite(before) ? Math.max(0, ((value - before) / emitted) * 1000) : null;
-  return {
-    actualMs: deltaMs(current.delay, previous.delay),
-    targetMs: deltaMs(current.target, previous.target),
-    minimumMs: deltaMs(current.minimum, previous.minimum),
-  };
-}
-
-function setAudioCatchup(enabled, stats) {
-  if (state.audioCatchup === enabled) return;
-  state.audioCatchup = enabled;
-  const receiver = audioReceiver();
-  if (receiver) configureReceiverLatency(receiver);
-  console.info(
-    `browser audio low-latency catch-up ${enabled ? "enabled" : "released"}` +
-      (stats ? ` actual=${Math.round(stats.actualMs || 0)}ms target=${Math.round(stats.targetMs || 0)}ms min=${Math.round(stats.minimumMs || 0)}ms` : ""),
-  );
-}
-
-function flushVideoPlayout(reason, stats) {
-  const now = performance.now();
-  if (now - state.lastVideoLatencyFlushAt < VIDEO_BUFFER_FLUSH_COOLDOWN_MS) return;
-  state.lastVideoLatencyFlushAt = now;
-  state.videoBufferHighHits = 0;
-  const stream = state.videoStream;
-  if (!stream?.getVideoTracks().length) return;
-  console.warn(
-    `flushing browser video playout queue (${reason})` +
-      (stats ? ` actual=${Math.round(stats.actualMs || 0)}ms target=${Math.round(stats.targetMs || 0)}ms min=${Math.round(stats.minimumMs || 0)}ms` : ""),
-  );
-  // Detach only the HTML playout sink. The PeerConnection/receiver remains
-  // untouched, so this drops stale rendered frames without reconnecting ICE.
-  element.video.srcObject = null;
-  queueMicrotask(() => {
-    if (!state.connected || !state.videoStream) return;
-    element.video.srcObject = state.videoStream;
-    element.video.playbackRate = 1;
-    element.video.play().catch(onVideoAutoplayBlocked);
-  });
-}
-
-function applyLowLatencyWatchdog(videoInbound, audioInbound) {
-  // Re-apply hints because some browser versions change their internal target
-  // after a loss/jitter event even though the app-provided preference persists.
-  const aReceiver = audioReceiver();
-  const vReceiver = videoReceiver();
-  if (aReceiver) configureReceiverLatency(aReceiver);
-  if (vReceiver) configureReceiverLatency(vReceiver);
-
-  const audioStats = intervalJitterStats("audio", audioInbound);
-  if (audioStats?.actualMs != null) {
-    const extra = audioStats.minimumMs == null ? null : audioStats.actualMs - audioStats.minimumMs;
-    const avoidable = extra == null || extra > 35 || (audioStats.targetMs || 0) > 90;
-    if (!state.audioCatchup && audioStats.actualMs >= AUDIO_CATCHUP_TRIGGER_MS && avoidable) {
-      setAudioCatchup(true, audioStats);
-    } else if (state.audioCatchup && audioStats.actualMs <= AUDIO_CATCHUP_RELEASE_MS) {
-      setAudioCatchup(false, audioStats);
-    }
-  }
-
-  const videoStats = intervalJitterStats("video", videoInbound);
-  if (videoStats?.actualMs != null) {
-    const extra = videoStats.minimumMs == null ? videoStats.actualMs : videoStats.actualMs - videoStats.minimumMs;
-    if (videoStats.actualMs >= VIDEO_BUFFER_FLUSH_TRIGGER_MS && extra >= VIDEO_BUFFER_FLUSH_EXTRA_MS) {
-      state.videoBufferHighHits += 1;
-      if (state.videoBufferHighHits >= VIDEO_BUFFER_FLUSH_HITS) {
-        flushVideoPlayout("jitter-buffer growth", videoStats);
-      }
-    } else {
-      state.videoBufferHighHits = 0;
-    }
-  }
-}
-
 function updateInboundMetrics(inbound) {
   const previous = state.previousInbound;
+  const decodedTotal = inbound.framesDecoded || 0;
+  if (decodedTotal > (previous?.decoded || 0)) {
+    state.lastDecodedFrameAt = performance.now();
+  }
   if (previous) {
     const elapsedSeconds = (inbound.timestamp - previous.timestamp) / 1_000;
     const decoded = (inbound.framesDecoded || 0) - previous.decoded;
@@ -999,7 +746,7 @@ function updateInboundMetrics(inbound) {
 
   state.previousInbound = {
     timestamp: inbound.timestamp,
-    decoded: inbound.framesDecoded || 0,
+    decoded: decodedTotal,
     emitted: inbound.jitterBufferEmittedCount || 0,
     delay: inbound.jitterBufferDelay || 0,
   };
@@ -1262,7 +1009,9 @@ element.mobilePad.querySelectorAll("[data-button]").forEach((button) => {
 });
 
 element.audio.addEventListener("click", () => {
-  setAudioMuted(!state.audioMuted);
+  element.audioOut.muted = !element.audioOut.muted;
+  element.audio.textContent = element.audioOut.muted ? "音声 OFF" : "音声 ON";
+  if (!element.audioOut.muted) element.audioOut.play().catch(onAudioAutoplayBlocked);
 });
 element.resync.addEventListener("click", resyncVideo);
 element.fullscreen.addEventListener("click", () => {
@@ -1271,7 +1020,7 @@ element.fullscreen.addEventListener("click", () => {
 });
 element.video.addEventListener("click", () => {
   element.video.play().catch(onVideoAutoplayBlocked);
-  if (!state.audioMuted) void ensureLowLatencyAudioOutput();
+  if (!element.audioOut.muted) element.audioOut.play().catch(onAudioAutoplayBlocked);
 });
 element.video.addEventListener("pause", () => {
   if (state.connected) element.video.play().catch(onVideoAutoplayBlocked);
@@ -1300,11 +1049,7 @@ window.addEventListener("beforeunload", () => {
   sendPadDisconnected();
 });
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden && state.connected) {
-    state.peer?.getReceivers().forEach(configureReceiverLatency);
-    if (!state.audioMuted) void ensureLowLatencyAudioOutput();
-    requestKeyframe("browser_became_visible");
-  }
+  if (!document.hidden && state.connected) requestKeyframe("browser_became_visible");
 });
 
 document.body.classList.toggle("low-power", lowPower);
@@ -1313,6 +1058,5 @@ element.name.value = "";
 refreshPads(true);
 setInterval(() => refreshPads(), lowPower ? 10_000 : 5_000);
 resetMetrics();
-setAudioMuted(false);
 setControls(false);
 setStatus("idle", "未接続", "ホストに接続してください", "ホスト画面の公開接続URLを貼り付けてください");
