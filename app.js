@@ -2,7 +2,7 @@
 
 const CONNECTION_TIMEOUT_MS = 45_000;
 const WELCOME_TIMEOUT_MS = 10_000;
-const AUDIO_JITTER_TARGET_MS = 20;
+const AUDIO_JITTER_TARGET_MS = 40;
 const VIDEO_JITTER_TARGET_MS = 16;
 const VIDEO_PLAYOUT_DELAY_SECONDS = 0.016;
 const RECONNECT_GRACE_MS = 5_000;
@@ -10,15 +10,8 @@ const NETWORK_FEEDBACK_INTERVAL_MS = 2_000;
 const MAX_INPUT_BUFFER_BYTES = 64 * 1024;
 const VIDEO_STALL_MS = 2_000;
 const VIDEO_STALL_REQUEST_COOLDOWN_MS = 3_000;
-const SUPPORTED_NETWORK_MODES = new Set([
-  "auto",
-  "ipv6_direct",
-  "ipv4_port_mapping",
-  "pcp",
-  "upnp",
-  "nat_pmp",
-  "stun",
-]);
+const NETWORK_MODES = ["auto", "ipv6_direct", "stun"];
+const MAX_EXTERNAL_POOL_CANDIDATES = 32;
 
 const byId = (id) => document.getElementById(id);
 const element = {
@@ -66,8 +59,14 @@ const state = {
   audioStream: null,
   remoteCandidates: [],
   hostNetworkMode: null,
+  hostStunServers: [],
+  lastGoodExternalReported: false,
+  baseUrl: null,
+  traversalSession: null,
+  guestName: "",
   connected: false,
   manual: false,
+  retrying: false,
   peerStarting: false,
   videoStarted: false,
   lastVideoFrameAt: 0,
@@ -220,26 +219,24 @@ function preferH264(transceiver) {
   }
 }
 
-function iceServersForMode(mode) {
-  if (mode === "ipv6_direct") return [];
+function iceServersForMode(networkMode, stunServers) {
+  if (networkMode === "ipv6_direct") return [];
   return [
     {
-      urls: [
-        "stun:stun.l.google.com:19302",
-        "stun:stun1.l.google.com:19302",
-        "stun:stun2.l.google.com:19302",
-      ],
+      urls: stunServers.length
+        ? stunServers
+        : ["stun:stun.l.google.com:19302", "stun:stun.cloudflare.com:3478"],
     },
   ];
 }
 
-async function createPeer(generation, networkMode) {
+async function createPeer(generation, networkMode, stunServers) {
   if (generation !== state.generation || state.peer || state.peerStarting) return;
   state.peerStarting = true;
 
   try {
     const peer = new RTCPeerConnection({
-      iceServers: iceServersForMode(networkMode),
+      iceServers: iceServersForMode(networkMode, stunServers),
       bundlePolicy: "max-bundle",
       rtcpMuxPolicy: "require",
       iceCandidatePoolSize: 0,
@@ -413,6 +410,48 @@ function requestInitialKeyframes(generation) {
   state.syncTimer = setInterval(request, 250);
 }
 
+function externalPoolCandidates(values) {
+  if (!Array.isArray(values)) return [];
+  const seen = new Set();
+  const result = [];
+  for (const value of values) {
+    if (typeof value !== "string") continue;
+    const match = /^(\d{1,3}(?:\.\d{1,3}){3}):(\d{1,5})$/.exec(value.trim());
+    if (!match) continue;
+    const ip = match[1];
+    const port = Number(match[2]);
+    if (!isPublicIpv4(ip) || port < 1 || port > 65535 || seen.has(value)) continue;
+    seen.add(value);
+    const priority = 1694498815 - result.length;
+    result.push({
+      candidate: `candidate:rpweb${result.length} 1 udp ${priority} ${ip} ${port} typ srflx`,
+      sdpMid: "0",
+      sdpMLineIndex: 0,
+      _remotePlayExternal: true,
+    });
+    if (result.length >= MAX_EXTERNAL_POOL_CANDIDATES) break;
+  }
+  return result;
+}
+
+function isPublicIpv4(value) {
+  const parts = value.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) {
+    return false;
+  }
+  const [a, b, c] = parts;
+  return !(
+    a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && (b === 0 || b === 168)) ||
+    (a === 198 && (b === 18 || b === 19)) ||
+    (a === 198 && b === 51 && c === 100) ||
+    (a === 203 && b === 0 && c === 113)
+  );
+}
+
 async function handleSignal(raw, generation) {
   let message;
   try {
@@ -424,26 +463,40 @@ async function handleSignal(raw, generation) {
 
   switch (message.type) {
     case "welcome": {
-      const mode = String(message.network_mode || "").toLowerCase();
-      if (!SUPPORTED_NETWORK_MODES.has(mode)) {
-        await fail("ホストから未対応の接続方式が通知されました。HostとGuestを同じ版にしてください。");
+      const mode = String(message.network_mode || "auto").toLowerCase();
+      if (!NETWORK_MODES.includes(mode)) {
+        await fatal("ホストから未対応の接続方式が通知されました。HostとGuestを同じ版にしてください。");
         return;
       }
       if (state.hostNetworkMode && state.hostNetworkMode !== mode) {
-        await fail("接続中にホストの接続方式が変更されました。一度切断して再接続してください。");
+        await fatal("接続中にホストの接続方式が変更されました。一度切断して再接続してください。");
         return;
       }
       state.hostNetworkMode = mode;
+      state.hostStunServers = Array.isArray(message.stun_servers)
+        ? message.stun_servers.filter((url) => typeof url === "string" && url.startsWith("stun:"))
+        : [];
       clearTimeout(state.welcomeTimer);
-      setStatus("connecting", "接続中", "接続方式を準備しています", `Host方式: ${mode}`);
-      await createPeer(generation, mode);
+      clearTimeout(state.connectionTimer);
+      state.connectionTimer = setTimeout(() => {
+        if (generation === state.generation && !state.connected) {
+          void fail(`${mode} の接続がタイムアウトしました。`);
+        }
+      }, CONNECTION_TIMEOUT_MS);
+      setStatus("connecting", "接続中", "接続方式を準備しています", `ホスト設定: ${mode}`);
+      await createPeer(generation, mode, state.hostStunServers);
       break;
     }
     case "answer":
       if (!state.peer || !message.sdp) return;
       await state.peer.setRemoteDescription({ type: "answer", sdp: message.sdp });
       for (const candidate of state.remoteCandidates.splice(0)) {
-        await state.peer.addIceCandidate(candidate);
+        try {
+          await state.peer.addIceCandidate(candidate);
+        } catch (error) {
+          if (!candidate._remotePlayExternal) throw error;
+          console.warn("Host external STUN candidate was rejected", candidate.candidate, error);
+        }
       }
       break;
     case "candidate":
@@ -454,8 +507,23 @@ async function handleSignal(raw, generation) {
         state.remoteCandidates.push(message.candidate);
       }
       break;
+    case "external_candidate_pool": {
+      const candidates = externalPoolCandidates(message.candidates);
+      for (const candidate of candidates) {
+        if (state.peer?.remoteDescription) {
+          try {
+            await state.peer.addIceCandidate(candidate);
+          } catch (error) {
+            console.warn("Host external STUN candidate was rejected", candidate.candidate, error);
+          }
+        } else {
+          state.remoteCandidates.push(candidate);
+        }
+      }
+      break;
+    }
     case "error":
-      await fail(message.message || `ホストが接続を拒否しました (${message.code || "unknown"})`);
+      await fatal(message.message || `ホストが接続を拒否しました (${message.code || "unknown"})`);
       break;
     case "disconnect":
       await stop(false, message.reason || "ホストから切断されました");
@@ -465,24 +533,13 @@ async function handleSignal(raw, generation) {
   }
 }
 
-async function start() {
-  element.error.textContent = "";
-  let url;
-  try {
-    url = normalizeWebSocketUrl(element.url.value);
-  } catch (error) {
-    element.error.textContent = error.message;
-    return;
-  }
-
-  const selectedPad = padSelection(element.gamepad.value);
-  await teardown(false, false);
-
+async function openRouteAttempt() {
   const generation = ++state.generation;
   state.manual = false;
-  state.lockedPad = selectedPad;
-  state.padIndex = selectedPad;
+  state.retrying = false;
   state.hostNetworkMode = null;
+  state.hostStunServers = [];
+  state.lastGoodExternalReported = false;
   state.remoteCandidates = [];
   state.videoStarted = false;
   state.lastVideoFrameAt = 0;
@@ -490,13 +547,17 @@ async function start() {
   state.lastStallRequestAt = 0;
   element.stage.classList.remove("has-video");
   setControls(true);
-  setStatus("connecting", "接続中", "ホストへ接続しています", "WebSocketシグナリングを開始しています");
-
-  const name = element.name.value.trim() || "ブラウザゲスト";
-  element.url.value = url;
+  setStatus(
+    "connecting",
+    "接続中",
+    "ホストへ接続しています",
+    "WebSocketシグナリングを開始しています",
+  );
 
   try {
-    state.websocket = new WebSocket(url);
+    const signalingUrl = new URL(state.baseUrl);
+    if (state.traversalSession) signalingUrl.searchParams.set("rp_session", state.traversalSession);
+    state.websocket = new WebSocket(signalingUrl);
   } catch (error) {
     await fail(error.message);
     return;
@@ -510,7 +571,7 @@ async function start() {
 
   state.websocket.onopen = () => {
     if (generation !== state.generation) return;
-    sendSignal({ type: "name", name });
+    sendSignal({ type: "name", name: state.guestName });
     setStatus("connecting", "接続中", "ホスト設定を待っています", "接続方式の通知を待っています");
     state.welcomeTimer = setTimeout(() => {
       if (generation === state.generation && !state.hostNetworkMode) {
@@ -537,11 +598,39 @@ async function start() {
   };
 }
 
+async function start() {
+  element.error.textContent = "";
+  let url;
+  try {
+    url = normalizeWebSocketUrl(element.url.value);
+  } catch (error) {
+    element.error.textContent = error.message;
+    return;
+  }
+
+  const selectedPad = padSelection(element.gamepad.value);
+  const name = element.name.value.trim() || "ブラウザゲスト";
+  await teardown(false, false);
+  state.baseUrl = url;
+  state.traversalSession = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  state.guestName = name;
+  state.lockedPad = selectedPad;
+  state.padIndex = selectedPad;
+  element.url.value = url;
+  await openRouteAttempt();
+}
+
 async function stop(notify = true, reason = "切断しました") {
   await teardown(notify, true, reason);
 }
 
 async function fail(message) {
+  if (state.manual || state.retrying) return;
+  state.retrying = true;
+  await fatal(message);
+}
+
+async function fatal(message) {
   await teardown(false, false);
   element.error.textContent = message;
   setStatus("error", "接続失敗", "接続できませんでした", message);
@@ -586,6 +675,12 @@ async function teardown(notify, showIdle, reason = "切断しました") {
     audioStream: null,
     remoteCandidates: [],
     hostNetworkMode: null,
+    hostStunServers: [],
+    lastGoodExternalReported: false,
+    baseUrl: null,
+    traversalSession: null,
+    guestName: "",
+    retrying: false,
     peerStarting: false,
     videoStarted: false,
     lastVideoFrameAt: 0,
@@ -699,6 +794,24 @@ async function updateStats() {
     const rttMs = state.measuredRttMs ?? pairRttMs;
     if (Number.isFinite(rttMs)) {
       element.rtt.textContent = rttMs > 0 && rttMs < 1 ? "<1 ms" : `${Math.round(rttMs)} ms`;
+    }
+
+    if (pair && !state.lastGoodExternalReported) {
+      const remote = reports.get(pair.remoteCandidateId);
+      const candidateType = String(remote?.candidateType || "").toLowerCase();
+      const address = remote?.address || remote?.ip;
+      const port = Number(remote?.port);
+      if (
+        (candidateType === "srflx" || candidateType === "prflx") &&
+        typeof address === "string" &&
+        isPublicIpv4(address) &&
+        Number.isInteger(port) &&
+        port > 0 &&
+        port <= 65535 &&
+        sendSignal({ type: "last_good_external_candidate", candidate: `${address}:${port}` })
+      ) {
+        state.lastGoodExternalReported = true;
+      }
     }
 
     if (!inbound) return;
