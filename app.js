@@ -2,9 +2,9 @@
 
 const CONNECTION_TIMEOUT_MS = 45_000;
 const WELCOME_TIMEOUT_MS = 10_000;
-const AUDIO_JITTER_TARGET_MS = 40;
-const VIDEO_JITTER_TARGET_MS = 16;
-const VIDEO_PLAYOUT_DELAY_SECONDS = 0.016;
+const AUDIO_JITTER_TARGET_MS = 20;
+const VIDEO_JITTER_TARGET_MS = 4;
+const VIDEO_PLAYOUT_DELAY_SECONDS = VIDEO_JITTER_TARGET_MS / 1_000;
 const RECONNECT_GRACE_MS = 5_000;
 const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 10_000;
@@ -198,18 +198,27 @@ function configureReceiverLatency(receiver) {
     return;
   }
 
-  // Keep one frame of explicit cushion. A forced zero target makes Chromium
-  // repeatedly shrink and grow its implicit safety margin under ordinary
-  // packet/scheduler jitter, which feels like latency moving back and forth.
+  // Remote play prefers freshness over smooth playout. Ask Chromium for only
+  // a few milliseconds of explicit video cushion. jitterBufferTarget is the
+  // modern control; use playoutDelayHint only as a fallback instead of setting
+  // two overlapping delay hints on the same receiver.
+  let configured = false;
   try {
-    if ("jitterBufferTarget" in receiver) receiver.jitterBufferTarget = VIDEO_JITTER_TARGET_MS;
+    if ("jitterBufferTarget" in receiver) {
+      receiver.jitterBufferTarget = VIDEO_JITTER_TARGET_MS;
+      configured = true;
+    }
   } catch (error) {
     console.debug(`video jitterBufferTarget=${VIDEO_JITTER_TARGET_MS} was rejected`, error);
   }
-  try {
-    if ("playoutDelayHint" in receiver) receiver.playoutDelayHint = VIDEO_PLAYOUT_DELAY_SECONDS;
-  } catch (error) {
-    console.debug(`video playoutDelayHint=${VIDEO_PLAYOUT_DELAY_SECONDS} was rejected`, error);
+  if (!configured) {
+    try {
+      if ("playoutDelayHint" in receiver) {
+        receiver.playoutDelayHint = VIDEO_PLAYOUT_DELAY_SECONDS;
+      }
+    } catch (error) {
+      console.debug(`video playoutDelayHint=${VIDEO_PLAYOUT_DELAY_SECONDS} was rejected`, error);
+    }
   }
 }
 
@@ -901,11 +910,24 @@ function updateInboundMetrics(inbound) {
     const decoded = (inbound.framesDecoded || 0) - previous.decoded;
     const emitted = (inbound.jitterBufferEmittedCount || 0) - previous.emitted;
     const delay = (inbound.jitterBufferDelay || 0) - previous.delay;
+    const minimumDelay = (inbound.jitterBufferMinimumDelay || 0) - previous.minimumDelay;
+    const targetDelay = (inbound.jitterBufferTargetDelay || 0) - previous.targetDelay;
+    const decodeTime = (inbound.totalDecodeTime || 0) - previous.decodeTime;
+    const dropped = (inbound.framesDropped || 0) - previous.dropped;
     if (elapsedSeconds > 0 && decoded >= 0) {
       element.fps.textContent = `${Math.round(decoded / elapsedSeconds)} fps`;
     }
     if (emitted > 0 && delay >= 0) {
       element.buffer.textContent = `${Math.round((delay / emitted) * 1_000)} ms`;
+    }
+    if (emitted > 0 || decoded > 0 || dropped > 0) {
+      console.debug("RemotePlay video playout stats", {
+        jitterMs: emitted > 0 && delay >= 0 ? (delay / emitted) * 1_000 : null,
+        jitterMinimumMs: emitted > 0 && minimumDelay >= 0 ? (minimumDelay / emitted) * 1_000 : null,
+        jitterTargetMs: emitted > 0 && targetDelay >= 0 ? (targetDelay / emitted) * 1_000 : null,
+        decodeMs: decoded > 0 && decodeTime >= 0 ? (decodeTime / decoded) * 1_000 : null,
+        droppedFrames: Math.max(0, dropped),
+      });
     }
   } else if (Number.isFinite(inbound.framesPerSecond)) {
     element.fps.textContent = `${Math.round(inbound.framesPerSecond)} fps`;
@@ -916,6 +938,10 @@ function updateInboundMetrics(inbound) {
     decoded: decodedTotal,
     emitted: inbound.jitterBufferEmittedCount || 0,
     delay: inbound.jitterBufferDelay || 0,
+    minimumDelay: inbound.jitterBufferMinimumDelay || 0,
+    targetDelay: inbound.jitterBufferTargetDelay || 0,
+    decodeTime: inbound.totalDecodeTime || 0,
+    dropped: inbound.framesDropped || 0,
   };
 }
 
