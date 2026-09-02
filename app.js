@@ -6,6 +6,8 @@ const AUDIO_JITTER_TARGET_MS = 40;
 const VIDEO_JITTER_TARGET_MS = 16;
 const VIDEO_PLAYOUT_DELAY_SECONDS = 0.016;
 const RECONNECT_GRACE_MS = 5_000;
+const RETRY_BASE_MS = 1_000;
+const RETRY_MAX_MS = 10_000;
 const NETWORK_FEEDBACK_INTERVAL_MS = 2_000;
 const MAX_INPUT_BUFFER_BYTES = 64 * 1024;
 const VIDEO_STALL_MS = 2_000;
@@ -76,6 +78,8 @@ const state = {
   connectionTimer: null,
   welcomeTimer: null,
   reconnectTimer: null,
+  retryTimer: null,
+  reconnectAttempt: 0,
   statsTimer: null,
   syncTimer: null,
   padFrame: null,
@@ -105,7 +109,13 @@ function setStatus(kind, label, title, detail) {
 }
 
 function connectionActive() {
-  return Boolean(state.connected || state.websocket || state.peer);
+  return Boolean(
+    state.connected || state.websocket || state.peer || state.retryTimer || state.retrying,
+  );
+}
+
+function retryDelay(attempt) {
+  return Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** Math.min(4, Math.max(0, attempt - 1)));
 }
 
 function setControls(active) {
@@ -305,6 +315,11 @@ function handlePeerState(generation, peer) {
     case "connected":
       clearTimeout(state.connectionTimer);
       clearTimeout(state.reconnectTimer);
+      clearTimeout(state.retryTimer);
+      state.retryTimer = null;
+      state.reconnectAttempt = 0;
+      state.retrying = false;
+      element.error.textContent = "";
       state.connected = true;
       setControls(true);
       setStatus("connected", "接続済み", "映像を受信しています", "WebRTC接続が確立しました");
@@ -328,7 +343,7 @@ function handlePeerState(generation, peer) {
       void fail("WebRTC接続に失敗しました。URLとネットワークを確認してください。");
       break;
     case "closed":
-      if (!state.manual) void stop(false, "接続が終了しました");
+      if (!state.manual) void fail("WebRTC接続が終了しました。");
       break;
     default:
       break;
@@ -534,6 +549,8 @@ async function handleSignal(raw, generation) {
 }
 
 async function openRouteAttempt() {
+  clearTimeout(state.retryTimer);
+  state.retryTimer = null;
   const generation = ++state.generation;
   state.manual = false;
   state.retrying = false;
@@ -549,9 +566,11 @@ async function openRouteAttempt() {
   setControls(true);
   setStatus(
     "connecting",
-    "接続中",
+    state.reconnectAttempt > 0 ? `再試行 ${state.reconnectAttempt}` : "接続中",
     "ホストへ接続しています",
-    "WebSocketシグナリングを開始しています",
+    state.reconnectAttempt > 0
+      ? `同じSTUNセッションで再接続しています（${state.reconnectAttempt}回目）`
+      : "WebSocketシグナリングを開始しています",
   );
 
   try {
@@ -613,6 +632,7 @@ async function start() {
   await teardown(false, false);
   state.baseUrl = url;
   state.traversalSession = crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+  state.reconnectAttempt = 0;
   state.guestName = name;
   state.lockedPad = selectedPad;
   state.padIndex = selectedPad;
@@ -627,7 +647,25 @@ async function stop(notify = true, reason = "切断しました") {
 async function fail(message) {
   if (state.manual || state.retrying) return;
   state.retrying = true;
-  await fatal(message);
+  const nextAttempt = state.reconnectAttempt + 1;
+  const delay = retryDelay(nextAttempt);
+  await teardown(false, false, "", true);
+  state.manual = false;
+  state.retrying = true;
+  state.reconnectAttempt = nextAttempt;
+  element.error.textContent = `${message} 自動再試行します。`;
+  setControls(true);
+  setStatus(
+    "connecting",
+    `再試行 ${nextAttempt}`,
+    "接続を再試行します",
+    `${Math.ceil(delay / 1_000)}秒後に同じSTUNセッションで再接続します`,
+  );
+  state.retryTimer = setTimeout(() => {
+    state.retryTimer = null;
+    if (state.manual) return;
+    void openRouteAttempt();
+  }, delay);
 }
 
 async function fatal(message) {
@@ -636,7 +674,17 @@ async function fatal(message) {
   setStatus("error", "接続失敗", "接続できませんでした", message);
 }
 
-async function teardown(notify, showIdle, reason = "切断しました") {
+async function teardown(notify, showIdle, reason = "切断しました", preserveSession = false) {
+  const preserved = preserveSession
+    ? {
+        baseUrl: state.baseUrl,
+        traversalSession: state.traversalSession,
+        guestName: state.guestName,
+        lockedPad: state.lockedPad,
+        padIndex: state.padIndex,
+        reconnectAttempt: state.reconnectAttempt,
+      }
+    : null;
   state.manual = true;
   state.connected = false;
   if (notify) sendSignal({ type: "disconnect", reason: "Browser guest disconnected" });
@@ -646,6 +694,7 @@ async function teardown(notify, showIdle, reason = "切断しました") {
   clearTimeout(state.connectionTimer);
   clearTimeout(state.welcomeTimer);
   clearTimeout(state.reconnectTimer);
+  clearTimeout(state.retryTimer);
   clearInterval(state.statsTimer);
   clearInterval(state.syncTimer);
   if (state.padFrame !== null) cancelAnimationFrame(state.padFrame);
@@ -690,6 +739,8 @@ async function teardown(notify, showIdle, reason = "切断しました") {
     connectionTimer: null,
     welcomeTimer: null,
     reconnectTimer: null,
+    retryTimer: null,
+    reconnectAttempt: 0,
     statsTimer: null,
     syncTimer: null,
     padFrame: null,
@@ -702,6 +753,8 @@ async function teardown(notify, showIdle, reason = "切断しました") {
     measuredRttMs: null,
   });
 
+  if (preserved) Object.assign(state, preserved);
+
   resetVirtualPad();
   element.inputPulse.classList.remove("active");
   element.video.pause();
@@ -713,6 +766,7 @@ async function teardown(notify, showIdle, reason = "切断しました") {
   setControls(false);
   refreshPads(true);
   if (showIdle) {
+    element.error.textContent = "";
     setStatus("idle", "未接続", reason, "ホスト画面の公開接続URLを貼り付けてください");
   }
 }
