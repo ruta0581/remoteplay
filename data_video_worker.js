@@ -7,6 +7,7 @@ const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_CHUNKS = 4096;
 const MAX_ASSEMBLIES = 4;
 const FRAME_GAP_GRACE_MS = 6;
+const KEYFRAME_GAP_GRACE_MS = 25;
 const MAX_DECODER_QUEUE = 2;
 const REPORT_INTERVAL_MS = 250;
 const DEFAULT_CODEC = "avc1.42E01F";
@@ -424,6 +425,13 @@ async function drainCompleteFrames() {
       (assembly) => assembly.complete && isAhead(assembly.frameId, expected),
     );
     if (!newerComplete || gapTimer !== null) break;
+    // Large IDRs are split across many unordered SCTP messages. Give only the
+    // expected keyframe extra time to finish reassembly; ordinary P-frame gaps
+    // keep the aggressive 6 ms freshness budget.
+    const expectedAssembly = assemblies.get(expected);
+    const gapGraceMs = expectedAssembly?.keyframe
+      ? KEYFRAME_GAP_GRACE_MS
+      : FRAME_GAP_GRACE_MS;
     gapTimer = setTimeout(() => {
       gapTimer = null;
       const expectedNow = lastDecodedFrameId === null ? null : ((lastDecodedFrameId + 1) >>> 0);
@@ -441,7 +449,7 @@ async function drainCompleteFrames() {
       } else {
         resetForLoss("browser_fast_video_frame_gap");
       }
-    }, FRAME_GAP_GRACE_MS);
+    }, gapGraceMs);
     break;
   }
 }

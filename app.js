@@ -470,7 +470,7 @@ function startFastDataVideoRenderer(channel, generation) {
   try {
     offscreen = canvas.transferControlToOffscreen();
     canvas.dataset.transferred = "1";
-    worker = new Worker("data_video_worker.js?v=20260903-h264-dc3");
+    worker = new Worker("data_video_worker.js?v=20260903-h264-dc4");
   } catch (error) {
     console.warn("Could not start fast-video worker", error);
     return false;
