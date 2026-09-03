@@ -116,6 +116,8 @@ const state = {
   previousFeedback: null,
   nextFeedbackAt: 0,
   measuredRttMs: null,
+  clockOffsetMs: null,
+  clockSyncBestRttMs: null,
   mobile: false,
   virtualButtons: new Array(16).fill(0),
   virtualCounts: new Array(16).fill(0),
@@ -468,7 +470,7 @@ function startFastDataVideoRenderer(channel, generation) {
   try {
     offscreen = canvas.transferControlToOffscreen();
     canvas.dataset.transferred = "1";
-    worker = new Worker("data_video_worker.js?v=20260903-h264-dc1");
+    worker = new Worker("data_video_worker.js?v=20260903-h264-dc2");
   } catch (error) {
     console.warn("Could not start fast-video worker", error);
     return false;
@@ -486,6 +488,11 @@ function startFastDataVideoRenderer(channel, generation) {
     previousReceivedChunks: 0,
     previousLostChunks: 0,
     fps: 0,
+    pendingAssemblies: 0,
+    pendingAssemblyBytes: 0,
+    decoderQueue: 0,
+    captureToDisplayMs: null,
+    pipelineMs: null,
   };
   let workerReady = false;
   let firstFrameSeen = false;
@@ -540,18 +547,42 @@ function startFastDataVideoRenderer(channel, generation) {
         element.resolution.textContent = `${data.width} × ${data.height}`;
       }
       const pipelineMs = Number(data.pipelineMs);
-      element.display.textContent = Number.isFinite(pipelineMs)
-        ? `DC ${Math.max(0, Math.round(pipelineMs))} ms`
-        : "DC-WEBCODECS";
+      const assemblyMs = Number(data.assemblyMs);
+      const captureToDisplayMs = Number(data.captureToDisplayMs);
+      const encodedToDisplayMs = Number(data.encodedToDisplayMs);
+      element.display.textContent = Number.isFinite(captureToDisplayMs)
+        ? `~${Math.max(0, Math.round(captureToDisplayMs))} ms`
+        : Number.isFinite(pipelineMs)
+          ? `DC ${Math.max(0, Math.round(pipelineMs))} ms`
+          : "DC-WEBCODECS";
+      element.buffer.textContent = Number.isFinite(assemblyMs)
+        ? `AU ${Math.max(0, Math.round(assemblyMs))} ms`
+        : "0 ms";
       const fps = Number(data.fps);
       if (Number.isFinite(fps)) element.fps.textContent = `${Math.max(0, Math.round(fps))} fps`;
       if (state.fastVideoStats) {
         state.fastVideoStats.receivedChunks = Math.max(0, Number(data.receivedChunks) || 0);
         state.fastVideoStats.lostChunks = Math.max(0, Number(data.lostChunks) || 0);
         state.fastVideoStats.fps = Number.isFinite(fps) ? fps : state.fastVideoStats.fps;
+        state.fastVideoStats.pendingAssemblies = Math.max(0, Number(data.pendingAssemblies) || 0);
+        state.fastVideoStats.pendingAssemblyBytes = Math.max(0, Number(data.pendingAssemblyBytes) || 0);
+        state.fastVideoStats.decoderQueue = Math.max(0, Number(data.decoderQueue) || 0);
+        state.fastVideoStats.captureToDisplayMs = Number.isFinite(captureToDisplayMs) ? captureToDisplayMs : null;
+        state.fastVideoStats.pipelineMs = Number.isFinite(pipelineMs) ? pipelineMs : null;
+      }
+      if (Number.isFinite(captureToDisplayMs) || Number.isFinite(pipelineMs)) {
+        console.debug("RemotePlay fast-video latency", {
+          captureToDisplayMs: Number.isFinite(captureToDisplayMs) ? captureToDisplayMs : null,
+          encodedToDisplayMs: Number.isFinite(encodedToDisplayMs) ? encodedToDisplayMs : null,
+          dataChannelToDisplayMs: Number.isFinite(pipelineMs) ? pipelineMs : null,
+          assemblyMs: Number.isFinite(assemblyMs) ? assemblyMs : null,
+          decoderQueue: Math.max(0, Number(data.decoderQueue) || 0),
+          pendingAssemblies: Math.max(0, Number(data.pendingAssemblies) || 0),
+          pendingAssemblyBytes: Math.max(0, Number(data.pendingAssemblyBytes) || 0),
+          clockSyncRttMs: Number.isFinite(Number(data.clockSyncRttMs)) ? Number(data.clockSyncRttMs) : null,
+        });
       }
       element.loss.textContent = String(Math.max(0, Number(data.lostChunks) || 0));
-      element.buffer.textContent = "0 ms";
       return;
     }
     if (data?.type === "error") {
@@ -561,7 +592,13 @@ function startFastDataVideoRenderer(channel, generation) {
   worker.onerror = (event) => disableFastVideoAndFallback(event.message || "fast-video worker error", generation);
 
   try {
-    worker.postMessage({ type: "start", canvas: offscreen, codec: codecFromRemoteSdp() }, [offscreen]);
+    worker.postMessage({
+      type: "start",
+      canvas: offscreen,
+      codec: codecFromRemoteSdp(),
+      clockOffsetMs: state.clockOffsetMs,
+      clockSyncRttMs: state.clockSyncBestRttMs,
+    }, [offscreen]);
   } catch (error) {
     worker.terminate();
     state.fastVideoWorker = null;
@@ -893,8 +930,34 @@ function configureControlChannel(channel, generation) {
     try {
       const message = JSON.parse(await messageText(event.data));
       if (message.type === "ping" && Number.isFinite(message.sent_at)) {
+        const browserReceiveMs = Date.now();
         if (Number.isFinite(message.rtt_ms)) {
           state.measuredRttMs = Math.max(1, message.rtt_ms);
+          const rttMs = state.measuredRttMs;
+          // NTP-style midpoint estimate using the Host's existing ping RTT.
+          // The clocks need not be synchronized; only the lowest-jitter samples
+          // are allowed to move the offset materially.
+          const sampleOffsetMs = browserReceiveMs - (Number(message.sent_at) + rttMs / 2);
+          if (Number.isFinite(sampleOffsetMs)) {
+            const best = state.clockSyncBestRttMs;
+            if (!Number.isFinite(best) || rttMs < best) state.clockSyncBestRttMs = rttMs;
+            const acceptable = !Number.isFinite(best) || rttMs <= best + Math.max(8, best * 0.25);
+            if (!Number.isFinite(state.clockOffsetMs)) {
+              state.clockOffsetMs = sampleOffsetMs;
+            } else if (acceptable) {
+              const alpha = rttMs <= (state.clockSyncBestRttMs || rttMs) + 2 ? 0.25 : 0.08;
+              state.clockOffsetMs += (sampleOffsetMs - state.clockOffsetMs) * alpha;
+            }
+            if (state.fastVideoWorker) {
+              try {
+                state.fastVideoWorker.postMessage({
+                  type: "clock-sync",
+                  offsetMs: state.clockOffsetMs,
+                  rttMs: state.clockSyncBestRttMs || rttMs,
+                });
+              } catch (_) {}
+            }
+          }
         }
         sendInput({ type: "pong", sent_at: message.sent_at });
       } else if (message.type === "disconnect") {
@@ -1323,6 +1386,8 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
     previousFeedback: null,
     nextFeedbackAt: 0,
     measuredRttMs: null,
+    clockOffsetMs: null,
+    clockSyncBestRttMs: null,
   });
 
   if (preserved) Object.assign(state, preserved);
