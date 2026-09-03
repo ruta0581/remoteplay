@@ -5,11 +5,10 @@ const WIRE_VERSION = 1;
 const HEADER_BYTES = 40;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_CHUNKS = 4096;
-const MAX_ASSEMBLIES = 3;
-const MAX_PENDING_ASSEMBLY_BYTES = 4 * 1024 * 1024;
-const MAX_DECODER_QUEUE = 1;
+const MAX_ASSEMBLIES = 4;
+const FRAME_GAP_GRACE_MS = 6;
+const MAX_DECODER_QUEUE = 2;
 const REPORT_INTERVAL_MS = 250;
-const KEYFRAME_REQUEST_MIN_INTERVAL_MS = 300;
 const DEFAULT_CODEC = "avc1.42E01F";
 
 let stopped = false;
@@ -21,7 +20,6 @@ let waitingForKeyframe = true;
 let pendingFrame = null;
 let drawQueued = false;
 let assemblies = new Map();
-let pendingAssemblyBytes = 0;
 let lastDecodedFrameId = null;
 let gapTimer = null;
 let cachedParameterSets = [];
@@ -30,14 +28,12 @@ let decodedFrames = 0;
 let renderedFrames = 0;
 let decoderResets = 0;
 let receivedChunks = 0;
-let receivedBytes = 0;
 let lostChunks = 0;
 let droppedAssemblies = 0;
 let lastReportAt = 0;
 let fpsWindowStartedAt = performance.now();
 let fpsWindowFrames = 0;
 let lastFormat = "unknown";
-let lastKeyframeRequestAt = -Infinity;
 let clockOffsetMs = null; // browser wall clock - host wall clock
 let clockSyncRttMs = null;
 
@@ -49,10 +45,7 @@ function postError(error) {
   self.postMessage({ type: "error", message: errorMessage(error) });
 }
 
-function requestKeyframe(reason, force = false) {
-  const now = performance.now();
-  if (!force && now - lastKeyframeRequestAt < KEYFRAME_REQUEST_MIN_INTERVAL_MS) return;
-  lastKeyframeRequestAt = now;
+function requestKeyframe(reason) {
   self.postMessage({ type: "request-keyframe", reason });
 }
 
@@ -79,15 +72,18 @@ function concatNals(nals) {
   const out = new Uint8Array(total);
   let offset = 0;
   for (const nal of nals) {
-    out[offset] = 0;
-    out[offset + 1] = 0;
-    out[offset + 2] = 0;
-    out[offset + 3] = 1;
+    out.set([0, 0, 0, 1], offset);
     offset += 4;
     out.set(nal, offset);
     offset += nal.byteLength;
   }
   return out;
+}
+
+function normalizeAnnexB(data) {
+  const nals = [];
+  forEachAnnexBNal(data, (nal) => nals.push(nal.slice()));
+  return nals.length ? concatNals(nals) : null;
 }
 
 function tryLengthPrefixed(data, lengthBytes) {
@@ -98,7 +94,7 @@ function tryLengthPrefixed(data, lengthBytes) {
     for (let i = 0; i < lengthBytes; i += 1) length = (length << 8) | data[offset + i];
     offset += lengthBytes;
     if (length <= 0 || offset + length > data.byteLength) return null;
-    const nal = data.subarray(offset, offset + length);
+    const nal = data.slice(offset, offset + length);
     const type = nal[0] & 0x1f;
     if (!nal.byteLength || type < 1 || type > 23) return null;
     nals.push(nal);
@@ -109,16 +105,17 @@ function tryLengthPrefixed(data, lengthBytes) {
 
 function normalizeAccessUnit(source) {
   if (!source.byteLength) throw new Error("received an empty H.264 access unit");
-  // Host fast-video normally sends Annex-B already. Do not normalize/copy a
-  // complete AU just to rewrite start codes; WebCodecs accepts Annex-B as-is.
-  if (isAnnexB(source)) return { data: source, format: "annexb-zero-copy" };
+  if (isAnnexB(source)) {
+    const normalized = normalizeAnnexB(source);
+    if (normalized) return { data: normalized, format: "annexb" };
+  }
   for (const lengthBytes of [4, 2, 1]) {
     const converted = tryLengthPrefixed(source, lengthBytes);
     if (converted) return { data: converted, format: `avcc-${lengthBytes}` };
   }
   const nalType = source[0] & 0x1f;
   if (nalType >= 1 && nalType <= 23) {
-    return { data: concatNals([source]), format: `raw-nal-${nalType}` };
+    return { data: concatNals([source.slice()]), format: `raw-nal-${nalType}` };
   }
   throw new Error(`unsupported H.264 access-unit layout (NAL type ${nalType})`);
 }
@@ -172,8 +169,8 @@ function prependCachedParameterSets(data, metadata, key) {
   if (!key) return data;
   if (metadata.parameterSets.length) cachedParameterSets = metadata.parameterSets.map((nal) => nal.slice());
   if ((metadata.hasSps && metadata.hasPps) || cachedParameterSets.length === 0) return data;
-  const nals = [...cachedParameterSets];
-  forEachAnnexBNal(data, (nal) => nals.push(nal));
+  const nals = cachedParameterSets.map((nal) => nal.slice());
+  forEachAnnexBNal(data, (nal) => nals.push(nal.slice()));
   return concatNals(nals);
 }
 
@@ -201,8 +198,7 @@ function reportFrame(frame, timing) {
   const width = frame.displayWidth || frame.codedWidth;
   const height = frame.displayHeight || frame.codedHeight;
   if (!width || !height) return;
-  // Resizing a canvas reallocates its backing surface. Only do it on an actual
-  // source resolution change, never per frame.
+  // Only resize the backing surface when the source resolution actually changes.
   if (canvas.width !== width || canvas.height !== height) {
     canvas.width = width;
     canvas.height = height;
@@ -210,7 +206,6 @@ function reportFrame(frame, timing) {
   context.drawImage(frame, 0, 0, width, height);
   renderedFrames += 1;
   fpsWindowFrames += 1;
-
   const nowPerf = performance.now();
   const nowWall = Date.now();
   const elapsed = Math.max(1, nowPerf - fpsWindowStartedAt);
@@ -223,7 +218,6 @@ function reportFrame(frame, timing) {
   const encodedToDisplayMs = Number.isFinite(clockOffsetMs) && Number.isFinite(timing.encodedUnixMs)
     ? Math.max(0, nowWall - (timing.encodedUnixMs + clockOffsetMs))
     : null;
-
   if (nowPerf - lastReportAt >= REPORT_INTERVAL_MS || renderedFrames === 1) {
     lastReportAt = nowPerf;
     if (elapsed >= 1000) {
@@ -245,11 +239,10 @@ function reportFrame(frame, timing) {
       renderedFrames,
       decoderResets,
       receivedChunks,
-      receivedBytes,
       lostChunks,
       droppedAssemblies,
       pendingAssemblies: assemblies.size,
-      pendingAssemblyBytes,
+      pendingAssemblyBytes: 0,
       format: lastFormat,
     });
   }
@@ -266,8 +259,6 @@ function drawLatest() {
   try {
     reportFrame(item.frame, item.timing);
   } finally {
-    // Explicitly release the decoded GPU-backed surface. Do not leave this to
-    // GC, which can create large latency spikes after many frames.
     item.frame.close();
   }
 }
@@ -281,9 +272,10 @@ function onDecodedFrame(frame) {
   if (pendingFrame) {
     try { pendingFrame.frame.close(); } catch (_) {}
   }
+  const now = performance.now();
   const timing = arrivalByTimestamp.get(frame.timestamp) || {
-    firstArrivalAt: performance.now(),
-    completeAt: performance.now(),
+    firstArrivalAt: now,
+    completeAt: now,
     capturedUnixMs: null,
     encodedUnixMs: null,
   };
@@ -293,9 +285,6 @@ function onDecodedFrame(frame) {
     drawQueued = true;
     queueMicrotask(drawLatest);
   }
-  // Keep at most one delta AU queued in WebCodecs. As soon as one output
-  // arrives, continue feeding the next sequential dependency-safe AU.
-  void drainCompleteFrames().catch(postError);
 }
 
 function createDecoder(config) {
@@ -320,31 +309,16 @@ function clearGapTimer() {
 
 function dropAssembly(assembly, countLoss = true) {
   if (!assembly) return;
-  const removed = assemblies.delete(assembly.frameId);
-  if (!removed) return;
-  if (assembly.expiryTimer !== null) {
-    clearTimeout(assembly.expiryTimer);
-    assembly.expiryTimer = null;
-  }
-  pendingAssemblyBytes = Math.max(0, pendingAssemblyBytes - assembly.frameSize);
+  assemblies.delete(assembly.frameId);
   droppedAssemblies += 1;
   if (countLoss) lostChunks += Math.max(1, assembly.chunkCount - assembly.receivedCount);
-}
-
-function resetDecoderForAvailableKeyframe() {
-  closePendingFrame();
-  arrivalByTimestamp.clear();
-  decoderResets += 1;
-  if (decoder && decoderConfig) {
-    decoder.reset();
-    decoder.configure(decoderConfig);
-  }
 }
 
 function resetForLoss(reason) {
   waitingForKeyframe = true;
   clearGapTimer();
-  for (const assembly of [...assemblies.values()]) dropAssembly(assembly, true);
+  for (const assembly of assemblies.values()) dropAssembly(assembly, true);
+  assemblies.clear();
   closePendingFrame();
   arrivalByTimestamp.clear();
   lastDecodedFrameId = null;
@@ -369,36 +343,8 @@ function isAhead(a, b) {
   return delta !== 0 && delta < 0x80000000;
 }
 
-function sortByFrameId(items) {
-  return items.sort((a, b) => (isAhead(a.frameId, b.frameId) ? 1 : -1));
-}
-
-function frameGapGraceMs(expectedAssembly, newerComplete) {
-  // If a newer IDR is already complete, there is no dependency reason to wait
-  // long for a missing delta frame; jump to the recovery boundary quickly.
-  if (newerComplete?.keyframe) return 2;
-  if (!expectedAssembly) return 4;
-  const chunks = expectedAssembly.chunkCount;
-  if (expectedAssembly.keyframe) return Math.min(20, Math.max(12, 10 + chunks * 0.45));
-  if (chunks <= 2) return 3;
-  if (chunks <= 5) return 6;
-  return Math.min(10, 6 + chunks * 0.25);
-}
-
-function assemblyExpiryMs(keyframe, chunkCount) {
-  // Normal P-frames stay extremely aggressive. IDRs are much larger and are
-  // the only safe H.264 resynchronization boundary, so give them a little more
-  // time without turning the transport into a playout buffer.
-  if (keyframe) return Math.min(35, Math.max(16, 14 + chunkCount * 0.75));
-  if (chunkCount <= 2) return 5;
-  if (chunkCount <= 5) return 8;
-  return Math.min(12, 8 + chunkCount * 0.35);
-}
-
 async function decodeAssembly(assembly) {
-  if (!assembly.keyframe && !waitingForKeyframe && decoder?.decodeQueueSize >= MAX_DECODER_QUEUE) {
-    return "deferred";
-  }
+  assemblies.delete(assembly.frameId);
   let converted;
   try {
     converted = normalizeAccessUnit(assembly.data);
@@ -413,7 +359,7 @@ async function decodeAssembly(assembly) {
   data = prependCachedParameterSets(data, metadata, key);
   metadata = h264Metadata(data);
 
-  if (waitingForKeyframe && !key) return "ignored";
+  if (waitingForKeyframe && !key) return false;
   if (key && metadata.codec && decoderConfig?.codec !== metadata.codec) {
     const config = await supportedConfig(metadata.codec);
     createDecoder(config);
@@ -423,21 +369,11 @@ async function decodeAssembly(assembly) {
     createDecoder(config);
   }
 
-  // latest-wins without breaking H.264 references: do not queue a second
-  // dependent P-frame while one is still decoding. Leave this assembly in the
-  // map and resume from onDecodedFrame(). A newly available IDR may supersede
-  // that queue and reset the decoder safely.
-  if (!key && decoder.decodeQueueSize >= MAX_DECODER_QUEUE) return "deferred";
-  if (key && decoder.decodeQueueSize > 0) {
-    try { resetDecoderForAvailableKeyframe(); } catch (error) { postError(error); }
+  if (decoder.decodeQueueSize > MAX_DECODER_QUEUE) {
+    resetForLoss("browser_fast_video_decode_backlog");
+    return false;
   }
 
-  assemblies.delete(assembly.frameId);
-  if (assembly.expiryTimer !== null) {
-    clearTimeout(assembly.expiryTimer);
-    assembly.expiryTimer = null;
-  }
-  pendingAssemblyBytes = Math.max(0, pendingAssemblyBytes - assembly.frameSize);
   if (key) waitingForKeyframe = false;
   const timestamp = assembly.frameId * 16667;
   arrivalByTimestamp.set(timestamp, {
@@ -458,13 +394,15 @@ async function decodeAssembly(assembly) {
     throw error;
   }
   lastDecodedFrameId = assembly.frameId;
-  return "decoded";
+  return true;
 }
 
 async function drainCompleteFrames() {
   if (stopped) return;
   if (waitingForKeyframe) {
-    const keys = sortByFrameId([...assemblies.values()].filter((assembly) => assembly.complete && assembly.keyframe));
+    const keys = [...assemblies.values()]
+      .filter((assembly) => assembly.complete && assembly.keyframe)
+      .sort((a, b) => (isAhead(a.frameId, b.frameId) ? 1 : -1));
     if (!keys.length) return;
     const selected = keys[keys.length - 1];
     for (const assembly of [...assemblies.values()]) {
@@ -478,16 +416,14 @@ async function drainCompleteFrames() {
     const next = assemblies.get(expected);
     if (next?.complete) {
       clearGapTimer();
-      const result = await decodeAssembly(next);
-      if (result === "deferred") break;
+      await decodeAssembly(next);
       continue;
     }
 
-    const newerComplete = sortByFrameId(
-      [...assemblies.values()].filter((assembly) => assembly.complete && isAhead(assembly.frameId, expected)),
-    )[0];
+    const newerComplete = [...assemblies.values()].find(
+      (assembly) => assembly.complete && isAhead(assembly.frameId, expected),
+    );
     if (!newerComplete || gapTimer !== null) break;
-    const graceMs = frameGapGraceMs(next, newerComplete);
     gapTimer = setTimeout(() => {
       gapTimer = null;
       const expectedNow = lastDecodedFrameId === null ? null : ((lastDecodedFrameId + 1) >>> 0);
@@ -495,18 +431,17 @@ async function drainCompleteFrames() {
         void drainCompleteFrames().catch(postError);
         return;
       }
-      const key = sortByFrameId(
-        [...assemblies.values()].filter(
-          (assembly) => assembly.complete && assembly.keyframe && isAhead(assembly.frameId, lastDecodedFrameId),
-        ),
-      ).pop();
+      const key = [...assemblies.values()]
+        .filter((assembly) => assembly.complete && assembly.keyframe && isAhead(assembly.frameId, lastDecodedFrameId))
+        .sort((a, b) => (isAhead(a.frameId, b.frameId) ? 1 : -1))
+        .pop();
       if (key) {
         waitingForKeyframe = true;
         void drainCompleteFrames().catch(postError);
       } else {
         resetForLoss("browser_fast_video_frame_gap");
       }
-    }, graceMs);
+    }, FRAME_GAP_GRACE_MS);
     break;
   }
 }
@@ -544,15 +479,9 @@ function parseChunk(buffer) {
   const payload = bytes.subarray(headerBytes);
   if (!payload.byteLength || offset + payload.byteLength > frameSize) return null;
   return {
-    frameId,
-    frameSize,
-    chunkIndex,
-    chunkCount,
-    offset,
+    frameId, frameSize, chunkIndex, chunkCount, offset,
     keyframe: Boolean(flags & 0x01),
-    capturedUnixMs,
-    encodedUnixMs,
-    payload,
+    capturedUnixMs, encodedUnixMs, payload,
   };
 }
 
@@ -561,7 +490,6 @@ function onChunk(buffer) {
   const chunk = parseChunk(buffer);
   if (!chunk) return;
   receivedChunks += 1;
-  receivedBytes += chunk.payload.byteLength;
   if (waitingForKeyframe && !chunk.keyframe) return;
 
   let assembly = assemblies.get(chunk.frameId);
@@ -579,19 +507,8 @@ function onChunk(buffer) {
       capturedUnixMs: chunk.capturedUnixMs,
       encodedUnixMs: chunk.encodedUnixMs,
       complete: false,
-      expiryTimer: null,
     };
     assemblies.set(chunk.frameId, assembly);
-    pendingAssemblyBytes += chunk.frameSize;
-    const expiryMs = assemblyExpiryMs(chunk.keyframe, chunk.chunkCount);
-    assembly.expiryTimer = setTimeout(() => {
-      const current = assemblies.get(chunk.frameId);
-      if (!current || current.complete || stopped) return;
-      dropAssembly(current, true);
-      // Any missing delta breaks the dependency chain; a missing IDR prevents
-      // recovery altogether. In both cases restart at a fresh keyframe.
-      resetForLoss(current.keyframe ? "browser_fast_video_keyframe_timeout" : "browser_fast_video_frame_timeout");
-    }, expiryMs);
   }
   if (
     assembly.frameSize !== chunk.frameSize ||
@@ -611,18 +528,18 @@ function onChunk(buffer) {
     if (assembly.receivedCount === assembly.chunkCount) {
       assembly.complete = true;
       assembly.completeAt = performance.now();
-      if (assembly.expiryTimer !== null) {
-        clearTimeout(assembly.expiryTimer);
-        assembly.expiryTimer = null;
-      }
     }
   }
 
-  // Bound memory and latency, not just frame count. A burst of giant IDRs must
-  // never leave multiple megabytes of stale AUs waiting behind WebCodecs.
-  if (assemblies.size > MAX_ASSEMBLIES || pendingAssemblyBytes > MAX_PENDING_ASSEMBLY_BYTES) {
-    resetForLoss("browser_fast_video_reassembly_backlog");
-    return;
+  if (assemblies.size > MAX_ASSEMBLIES) {
+    const candidates = [...assemblies.values()].filter((item) => item.frameId !== chunk.frameId);
+    candidates.sort((a, b) => (isAhead(a.frameId, b.frameId) ? 1 : -1));
+    const oldest = candidates[0];
+    if (oldest) {
+      dropAssembly(oldest, true);
+      resetForLoss("browser_fast_video_reassembly_backlog");
+      return;
+    }
   }
   if (assembly.complete) void drainCompleteFrames().catch(postError);
 }
@@ -643,9 +560,9 @@ function stop() {
   stopped = true;
   clearGapTimer();
   closePendingFrame();
-  for (const assembly of [...assemblies.values()]) dropAssembly(assembly, false);
+  for (const assembly of assemblies.values()) dropAssembly(assembly, false);
+  assemblies.clear();
   arrivalByTimestamp.clear();
-  pendingAssemblyBytes = 0;
   if (decoder) {
     try { decoder.close(); } catch (_) {}
     decoder = null;
