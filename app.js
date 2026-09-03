@@ -7,7 +7,7 @@ const PROTOCOL_VERSION = "1";
 const CONNECTION_TIMEOUT_MS = 45_000;
 const WELCOME_TIMEOUT_MS = 10_000;
 const AUDIO_JITTER_TARGET_MS = 20;
-const VIDEO_JITTER_TARGET_MS = 4;
+const VIDEO_JITTER_TARGET_MS = 0;
 const VIDEO_PLAYOUT_DELAY_SECONDS = VIDEO_JITTER_TARGET_MS / 1_000;
 const RECONNECT_GRACE_MS = 5_000;
 const RETRY_BASE_MS = 1_000;
@@ -30,6 +30,7 @@ const element = {
   badge: byId("badge"),
   badgeText: byId("badgeText"),
   video: byId("video"),
+  videoCanvas: byId("videoCanvas"),
   audioOut: byId("audioOut"),
   stage: byId("stage"),
   stageTitle: byId("stageTitle"),
@@ -80,6 +81,8 @@ const state = {
   lastDecodedFrameAt: 0,
   lastStallRequestAt: 0,
   frameCallbackId: null,
+  videoWorker: null,
+  videoRenderer: "video",
   connectionTimer: null,
   welcomeTimer: null,
   reconnectTimer: null,
@@ -280,9 +283,9 @@ async function createPeer(generation, networkMode, stunServers) {
       if (generation !== state.generation) return;
       configureReceiverLatency(receiver);
       if (track.kind === "video") {
-        addTrackOnce(state.videoStream, track);
-        element.video.play().catch(onVideoAutoplayBlocked);
-        monitorVideoFrames(generation);
+        if (!startLowLatencyVideoRenderer(track, generation)) {
+          startHtmlVideoFallback(track, generation);
+        }
       } else if (track.kind === "audio") {
         addTrackOnce(state.audioStream, track);
         if (!element.audioOut.muted) {
@@ -321,6 +324,110 @@ function addTrackOnce(stream, track) {
   if (!stream.getTracks().some((current) => current.id === track.id)) {
     stream.addTrack(track);
   }
+}
+
+function freshVideoCanvas() {
+  if (!element.videoCanvas) return null;
+  if (element.videoCanvas.dataset.transferred !== "1") return element.videoCanvas;
+  const canvas = document.createElement("canvas");
+  canvas.id = "videoCanvas";
+  canvas.className = "video-canvas";
+  canvas.hidden = true;
+  element.videoCanvas.replaceWith(canvas);
+  element.videoCanvas = canvas;
+  return canvas;
+}
+
+function startHtmlVideoFallback(track, generation) {
+  if (generation !== state.generation) return;
+  state.videoRenderer = "video";
+  element.stage.classList.remove("low-latency-canvas");
+  if (element.videoCanvas) element.videoCanvas.hidden = true;
+  addTrackOnce(state.videoStream, track);
+  element.video.playbackRate = 1;
+  element.video.play().catch(onVideoAutoplayBlocked);
+  monitorVideoFrames(generation);
+}
+
+function startLowLatencyVideoRenderer(track, generation) {
+  const canvas = freshVideoCanvas();
+  if (!canvas || typeof Worker !== "function" || !canvas.transferControlToOffscreen) {
+    return false;
+  }
+
+  let worker;
+  let renderTrack;
+  let offscreen;
+  try {
+    renderTrack = track.clone();
+    offscreen = canvas.transferControlToOffscreen();
+    canvas.dataset.transferred = "1";
+    worker = new Worker("video_worker.js?v=20260903-lowlatency-canvas");
+  } catch (error) {
+    console.warn("Low-latency video renderer is unavailable; using HTMLVideoElement", error);
+    try { renderTrack?.stop(); } catch (_) {}
+    return false;
+  }
+
+  state.videoWorker?.terminate();
+  state.videoWorker = worker;
+  state.videoRenderer = "canvas-pending";
+  let workerReady = false;
+
+  const fallback = (error) => {
+    if (generation !== state.generation || state.videoWorker !== worker) return;
+    console.warn("Low-latency canvas renderer failed; falling back to HTMLVideoElement", error);
+    worker.terminate();
+    state.videoWorker = null;
+    state.videoRenderer = "video";
+    startHtmlVideoFallback(track, generation);
+  };
+
+  worker.onmessage = ({ data }) => {
+    if (generation !== state.generation || state.videoWorker !== worker) return;
+    if (data?.type === "ready") {
+      workerReady = true;
+      state.videoRenderer = "canvas";
+      console.info("RemotePlay low-latency canvas renderer active");
+      element.stage.classList.add("low-latency-canvas");
+      canvas.hidden = false;
+      return;
+    }
+    if (data?.type === "frame") {
+      state.lastVideoFrameAt = performance.now();
+      state.lastDecodedFrameAt = state.lastVideoFrameAt;
+      if (!state.videoStarted) {
+        state.videoStarted = true;
+        element.stage.classList.add("has-video");
+        clearInterval(state.syncTimer);
+      }
+      if (data.width && data.height) {
+        element.resolution.textContent = `${data.width} × ${data.height}`;
+      }
+      // The canvas path intentionally bypasses HTMLVideoElement's scheduled
+      // playout clock, so requestVideoFrameCallback capture->display metadata
+      // is not available. Receiver jitter/decode timing remains visible in the
+      // other metrics.
+      element.display.textContent = "LOW-LATENCY";
+      return;
+    }
+    if (data?.type === "error") fallback(data.message || "worker error");
+  };
+  worker.onerror = (event) => fallback(event.message || "worker error");
+
+  try {
+    worker.postMessage({ type: "start", canvas: offscreen, track: renderTrack }, [offscreen, renderTrack]);
+  } catch (error) {
+    fallback(error);
+    return true;
+  }
+
+  setTimeout(() => {
+    if (generation === state.generation && state.videoWorker === worker && !workerReady) {
+      fallback("renderer initialization timed out");
+    }
+  }, 1500);
+  return true;
 }
 
 function handlePeerState(generation, peer) {
@@ -744,6 +851,10 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
   control?.close();
   peer?.close();
   websocket?.close();
+  if (state.videoWorker) {
+    try { state.videoWorker.postMessage({ type: "stop" }); } catch (_) {}
+    state.videoWorker.terminate();
+  }
 
   Object.assign(state, {
     websocket: null,
@@ -766,6 +877,8 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
     lastDecodedFrameAt: 0,
     lastStallRequestAt: 0,
     frameCallbackId: null,
+    videoWorker: null,
+    videoRenderer: "video",
     connectionTimer: null,
     welcomeTimer: null,
     reconnectTimer: null,
@@ -789,6 +902,8 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
   element.inputPulse.classList.remove("active");
   element.video.pause();
   element.video.srcObject = null;
+  element.stage.classList.remove("low-latency-canvas");
+  if (element.videoCanvas) element.videoCanvas.hidden = true;
   element.audioOut.pause();
   element.audioOut.srcObject = null;
   element.stage.classList.remove("has-video");
@@ -815,8 +930,10 @@ function onAudioAutoplayBlocked(error) {
 
 function resyncVideo() {
   state.peer?.getReceivers().forEach(configureReceiverLatency);
-  element.video.playbackRate = 1;
-  element.video.play().catch(onVideoAutoplayBlocked);
+  if (state.videoRenderer === "video") {
+    element.video.playbackRate = 1;
+    element.video.play().catch(onVideoAutoplayBlocked);
+  }
   requestSyncFrame("browser_manual_start");
 }
 
@@ -838,7 +955,18 @@ function monitorVideoFrames(generation) {
         ? metadata.captureTime
         : metadata.receiveTime;
       if (Number.isFinite(origin) && Number.isFinite(metadata.expectedDisplayTime)) {
-        element.display.textContent = `${Math.round(Math.max(0, metadata.expectedDisplayTime - origin))} ms`;
+        const displayDelayMs = Math.max(0, metadata.expectedDisplayTime - origin);
+        element.display.textContent = `${Math.round(displayDelayMs)} ms`;
+        // HTMLVideoElement fallback only: if the browser has accumulated a
+        // large live playout queue, temporarily run slightly faster to drain
+        // it instead of remaining hundreds of milliseconds behind forever.
+        // The dedicated canvas path does not need this because it is latest-frame.
+        if (state.videoRenderer === "video") {
+          const targetRate = displayDelayMs >= 250 ? 1.15 : displayDelayMs >= 120 ? 1.08 : 1.0;
+          if (Math.abs(element.video.playbackRate - targetRate) >= 0.01) {
+            element.video.playbackRate = targetRate;
+          }
+        }
       }
     }
     state.frameCallbackId = element.video.requestVideoFrameCallback(onFrame);

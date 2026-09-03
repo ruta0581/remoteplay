@@ -69,7 +69,21 @@ h2 { margin-bottom: 0; font-size: 1.18rem; }
   backdrop-filter: none;
 }
 .stage { position: relative; aspect-ratio: 16 / 9; overflow: hidden; background: #02060b; }
-video { display: block; width: 100%; height: 100%; object-fit: contain; background: #02060b; }
+video, .video-canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #02060b;
+}
+.video-canvas[hidden] { display: none; }
+.stage.low-latency-canvas video {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
 .placeholder {
   position: absolute;
   inset: 0;

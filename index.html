@@ -5,10 +5,10 @@
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
   <meta name="theme-color" content="#07101d">
   <meta name="description" content="RemotePlay Rustホストへ接続する低遅延ブラウザゲスト">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; media-src blob:; connect-src ws: wss:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; worker-src 'self'; style-src 'self'; media-src blob:; connect-src ws: wss:; object-src 'none'; base-uri 'none'; form-action 'none'">
   <title>RemotePlay Web Guest</title>
-  <link rel="stylesheet" href="style.css?v=20260903-protocol-1">
-  <script src="app.js?v=20260903-protocol-1" defer></script>
+  <link rel="stylesheet" href="style.css?v=20260903-lowlatency-canvas">
+  <script src="app.js?v=20260903-lowlatency-canvas" defer></script>
 </head>
 <body>
   <main class="shell">
@@ -30,6 +30,7 @@
     <section class="card" aria-label="リモート映像">
       <div id="stage" class="stage">
         <video id="video" autoplay playsinline></video>
+        <canvas id="videoCanvas" class="video-canvas" hidden></canvas>
         <audio id="audioOut" autoplay playsinline hidden></audio>
         <div class="placeholder">
           <div class="mark"><i></i><i></i><i></i></div>
