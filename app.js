@@ -82,6 +82,7 @@ const state = {
   lastStallRequestAt: 0,
   frameCallbackId: null,
   videoWorker: null,
+  videoTransformWorker: null,
   videoTransformReceiver: null,
   videoRenderer: "video",
   connectionTimer: null,
@@ -370,7 +371,6 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
     !canvas ||
     typeof Worker !== "function" ||
     typeof RTCRtpScriptTransform !== "function" ||
-    typeof VideoDecoder !== "function" ||
     !canvas.transferControlToOffscreen ||
     !("transform" in receiver)
   ) {
@@ -382,7 +382,7 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
   try {
     offscreen = canvas.transferControlToOffscreen();
     canvas.dataset.transferred = "1";
-    worker = new Worker("encoded_video_worker.js?v=20260903-webcodecs-transform");
+    worker = new Worker("encoded_video_worker.js?v=20260903-webcodecs-rxfix");
     const codec = negotiatedH264Codec(receiver);
     receiver.transform = new RTCRtpScriptTransform(
       worker,
@@ -395,32 +395,52 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
     );
   } catch (error) {
     console.warn("Encoded Transform + WebCodecs renderer is unavailable", error);
-    try { receiver.transform = null; } catch (_) {}
     try { worker?.terminate(); } catch (_) {}
     return false;
   }
 
-  state.videoWorker?.terminate();
-  state.videoWorker = worker;
+  if (state.videoTransformWorker && state.videoTransformWorker !== worker) {
+    try { state.videoTransformWorker.postMessage({ type: "stop" }); } catch (_) {}
+    state.videoTransformWorker.terminate();
+  }
+  state.videoTransformWorker = worker;
   state.videoTransformReceiver = receiver;
   state.videoRenderer = "webcodecs-pending";
   let workerReady = false;
+  let firstFrameSeen = false;
+  let fallbackStarted = false;
+  let firstFrameTimer = null;
+
+  const clearFirstFrameTimer = () => {
+    if (firstFrameTimer !== null) clearTimeout(firstFrameTimer);
+    firstFrameTimer = null;
+  };
 
   const fallback = (error) => {
-    if (generation !== state.generation || state.videoWorker !== worker) return;
+    if (
+      fallbackStarted ||
+      generation !== state.generation ||
+      state.videoTransformWorker !== worker
+    ) return;
+    fallbackStarted = true;
+    clearFirstFrameTimer();
     console.warn("Encoded Transform + WebCodecs renderer failed; using decoded-track fallback", error);
-    try { receiver.transform = null; } catch (_) {}
-    worker.terminate();
-    state.videoWorker = null;
-    state.videoTransformReceiver = null;
+
+    // Do not terminate or detach a receiver transform after it has entered the
+    // receive pipeline. Keep the worker alive as an immediate pass-through;
+    // otherwise Chromium can be left with a transform whose writable side is
+    // gone and the decoded MediaStreamTrack never produces frames.
+    try { worker.postMessage({ type: "passthrough-only" }); } catch (_) {}
     state.videoRenderer = "video";
+    element.stage.classList.remove("low-latency-canvas");
+    canvas.hidden = true;
     if (!startLowLatencyVideoRenderer(track, generation)) {
       startHtmlVideoFallback(track, generation);
     }
   };
 
   worker.onmessage = ({ data }) => {
-    if (generation !== state.generation || state.videoWorker !== worker) return;
+    if (generation !== state.generation || state.videoTransformWorker !== worker) return;
     if (data?.type === "ready") {
       workerReady = true;
       state.videoRenderer = "webcodecs";
@@ -429,6 +449,13 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
       canvas.hidden = false;
       element.display.textContent = "WEBCODECS";
       requestKeyframe("browser_data_channel_open");
+      firstFrameTimer = setTimeout(() => {
+        if (!firstFrameSeen) fallback("WebCodecs received no decodable video frame within 3 seconds");
+      }, 3000);
+      return;
+    }
+    if (data?.type === "diagnostic") {
+      console.debug("RemotePlay WebCodecs receiver frame", data);
       return;
     }
     if (data?.type === "request-keyframe") {
@@ -436,6 +463,8 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
       return;
     }
     if (data?.type === "frame") {
+      firstFrameSeen = true;
+      clearFirstFrameTimer();
       state.lastVideoFrameAt = performance.now();
       state.lastDecodedFrameAt = state.lastVideoFrameAt;
       if (!state.videoStarted) {
@@ -464,7 +493,11 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
   worker.onerror = (event) => fallback(event.message || "worker error");
 
   setTimeout(() => {
-    if (generation === state.generation && state.videoWorker === worker && !workerReady) {
+    if (
+      generation === state.generation &&
+      state.videoTransformWorker === worker &&
+      !workerReady
+    ) {
       fallback("Encoded Transform renderer initialization timed out");
     }
   }, 2000);
@@ -973,6 +1006,10 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
   control?.close();
   peer?.close();
   websocket?.close();
+  if (state.videoTransformWorker) {
+    try { state.videoTransformWorker.postMessage({ type: "stop" }); } catch (_) {}
+    state.videoTransformWorker.terminate();
+  }
   if (state.videoTransformReceiver) {
     try { state.videoTransformReceiver.transform = null; } catch (_) {}
   }
@@ -1003,6 +1040,7 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
     lastStallRequestAt: 0,
     frameCallbackId: null,
     videoWorker: null,
+    videoTransformWorker: null,
     videoTransformReceiver: null,
     videoRenderer: "video",
     connectionTimer: null,
