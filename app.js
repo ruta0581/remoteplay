@@ -82,6 +82,7 @@ const state = {
   lastStallRequestAt: 0,
   frameCallbackId: null,
   videoWorker: null,
+  videoTransformReceiver: null,
   videoRenderer: "video",
   connectionTimer: null,
   welcomeTimer: null,
@@ -283,7 +284,8 @@ async function createPeer(generation, networkMode, stunServers) {
       if (generation !== state.generation) return;
       configureReceiverLatency(receiver);
       if (track.kind === "video") {
-        if (!startLowLatencyVideoRenderer(track, generation)) {
+        if (!startEncodedWebCodecsRenderer(receiver, track, generation) &&
+            !startLowLatencyVideoRenderer(track, generation)) {
           startHtmlVideoFallback(track, generation);
         }
       } else if (track.kind === "audio") {
@@ -347,6 +349,126 @@ function startHtmlVideoFallback(track, generation) {
   element.video.playbackRate = 1;
   element.video.play().catch(onVideoAutoplayBlocked);
   monitorVideoFrames(generation);
+}
+
+
+function negotiatedH264Codec(receiver) {
+  try {
+    const codecs = receiver.getParameters?.().codecs || [];
+    const h264 = codecs.find((codec) => codec.mimeType?.toLowerCase() === "video/h264");
+    const profile = /(?:^|;)\s*profile-level-id=([0-9a-f]{6})/i.exec(h264?.sdpFmtpLine || "")?.[1];
+    if (profile) return `avc1.${profile.toUpperCase()}`;
+  } catch (error) {
+    console.debug("Could not read negotiated H.264 profile for WebCodecs", error);
+  }
+  return "avc1.42E01F";
+}
+
+function startEncodedWebCodecsRenderer(receiver, track, generation) {
+  const canvas = freshVideoCanvas();
+  if (
+    !canvas ||
+    typeof Worker !== "function" ||
+    typeof RTCRtpScriptTransform !== "function" ||
+    typeof VideoDecoder !== "function" ||
+    !canvas.transferControlToOffscreen ||
+    !("transform" in receiver)
+  ) {
+    return false;
+  }
+
+  let worker;
+  let offscreen;
+  try {
+    offscreen = canvas.transferControlToOffscreen();
+    canvas.dataset.transferred = "1";
+    worker = new Worker("encoded_video_worker.js?v=20260903-webcodecs-transform");
+    const codec = negotiatedH264Codec(receiver);
+    receiver.transform = new RTCRtpScriptTransform(
+      worker,
+      {
+        name: "remoteplay-webcodecs-video",
+        canvas: offscreen,
+        codec,
+      },
+      [offscreen],
+    );
+  } catch (error) {
+    console.warn("Encoded Transform + WebCodecs renderer is unavailable", error);
+    try { receiver.transform = null; } catch (_) {}
+    try { worker?.terminate(); } catch (_) {}
+    return false;
+  }
+
+  state.videoWorker?.terminate();
+  state.videoWorker = worker;
+  state.videoTransformReceiver = receiver;
+  state.videoRenderer = "webcodecs-pending";
+  let workerReady = false;
+
+  const fallback = (error) => {
+    if (generation !== state.generation || state.videoWorker !== worker) return;
+    console.warn("Encoded Transform + WebCodecs renderer failed; using decoded-track fallback", error);
+    try { receiver.transform = null; } catch (_) {}
+    worker.terminate();
+    state.videoWorker = null;
+    state.videoTransformReceiver = null;
+    state.videoRenderer = "video";
+    if (!startLowLatencyVideoRenderer(track, generation)) {
+      startHtmlVideoFallback(track, generation);
+    }
+  };
+
+  worker.onmessage = ({ data }) => {
+    if (generation !== state.generation || state.videoWorker !== worker) return;
+    if (data?.type === "ready") {
+      workerReady = true;
+      state.videoRenderer = "webcodecs";
+      console.info(`RemotePlay Encoded Transform + WebCodecs renderer active (${data.codec || "H.264"})`);
+      element.stage.classList.add("low-latency-canvas");
+      canvas.hidden = false;
+      element.display.textContent = "WEBCODECS";
+      requestKeyframe("browser_data_channel_open");
+      return;
+    }
+    if (data?.type === "request-keyframe") {
+      requestKeyframe("browser_video_stalled");
+      return;
+    }
+    if (data?.type === "frame") {
+      state.lastVideoFrameAt = performance.now();
+      state.lastDecodedFrameAt = state.lastVideoFrameAt;
+      if (!state.videoStarted) {
+        state.videoStarted = true;
+        element.stage.classList.add("has-video");
+        clearInterval(state.syncTimer);
+      }
+      if (data.width && data.height) {
+        element.resolution.textContent = `${data.width} × ${data.height}`;
+      }
+      const pipelineMs = Number(data.pipelineMs);
+      element.display.textContent = Number.isFinite(pipelineMs)
+        ? `WC ${Math.max(0, Math.round(pipelineMs))} ms`
+        : "WEBCODECS";
+      if (Number.isFinite(pipelineMs) && pipelineMs >= 80) {
+        console.debug("RemotePlay WebCodecs render pipeline is behind", {
+          pipelineMs,
+          decoderQueue: data.decoderQueue,
+          decodeResets: data.decodeResets,
+        });
+      }
+      return;
+    }
+    if (data?.type === "error") fallback(data.message || "worker error");
+  };
+  worker.onerror = (event) => fallback(event.message || "worker error");
+
+  setTimeout(() => {
+    if (generation === state.generation && state.videoWorker === worker && !workerReady) {
+      fallback("Encoded Transform renderer initialization timed out");
+    }
+  }, 2000);
+  return true;
 }
 
 function startLowLatencyVideoRenderer(track, generation) {
@@ -851,6 +973,9 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
   control?.close();
   peer?.close();
   websocket?.close();
+  if (state.videoTransformReceiver) {
+    try { state.videoTransformReceiver.transform = null; } catch (_) {}
+  }
   if (state.videoWorker) {
     try { state.videoWorker.postMessage({ type: "stop" }); } catch (_) {}
     state.videoWorker.terminate();
@@ -878,6 +1003,7 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
     lastStallRequestAt: 0,
     frameCallbackId: null,
     videoWorker: null,
+    videoTransformReceiver: null,
     videoRenderer: "video",
     connectionTimer: null,
     welcomeTimer: null,
@@ -933,6 +1059,9 @@ function resyncVideo() {
   if (state.videoRenderer === "video") {
     element.video.playbackRate = 1;
     element.video.play().catch(onVideoAutoplayBlocked);
+  }
+  if (state.videoRenderer === "webcodecs") {
+    requestKeyframe("browser_manual_start");
   }
   requestSyncFrame("browser_manual_start");
 }
