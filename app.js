@@ -1,5 +1,9 @@
 "use strict";
 
+// Change this manually when intentionally breaking Host/Guest compatibility.
+// Do not auto-increment this value for ordinary code changes.
+const PROTOCOL_VERSION = "1";
+
 const CONNECTION_TIMEOUT_MS = 45_000;
 const WELCOME_TIMEOUT_MS = 10_000;
 const AUDIO_JITTER_TARGET_MS = 20;
@@ -44,6 +48,7 @@ const element = {
   loss: byId("loss"),
   display: byId("display"),
   resolution: byId("resolution"),
+  protocolVersion: byId("protocolVersion"),
 };
 
 const lowPower =
@@ -487,6 +492,14 @@ async function handleSignal(raw, generation) {
 
   switch (message.type) {
     case "welcome": {
+      if (typeof message.protocol_version !== "string") {
+        await fatal(`このHostは内部バージョン確認に対応していません。旧Hostは接続できません。Guest version=${PROTOCOL_VERSION}`);
+        return;
+      }
+      if (message.protocol_version !== PROTOCOL_VERSION) {
+        await fatal(`内部バージョンが一致しません。Host=${message.protocol_version} / Guest=${PROTOCOL_VERSION}`);
+        return;
+      }
       const mode = String(message.network_mode || "auto").toLowerCase();
       if (!NETWORK_MODES.includes(mode)) {
         await fatal("ホストから未対応の接続方式が通知されました。HostとGuestを同じ版にしてください。");
@@ -599,8 +612,16 @@ async function openRouteAttempt() {
 
   state.websocket.onopen = () => {
     if (generation !== state.generation) return;
+    // Hello must be the first text signal. Host intentionally rejects older
+    // browser/Rust Guests that do not identify their internal protocol version.
+    sendSignal({ type: "hello", protocol_version: PROTOCOL_VERSION });
     sendSignal({ type: "name", name: state.guestName });
-    setStatus("connecting", "接続中", "ホスト設定を待っています", "接続方式の通知を待っています");
+    setStatus(
+      "connecting",
+      "接続中",
+      "ホスト設定を待っています",
+      `内部バージョン ${PROTOCOL_VERSION} を確認しています`,
+    );
     state.welcomeTimer = setTimeout(() => {
       if (generation === state.generation && !state.hostNetworkMode) {
         void fail("ホストから接続方式が通知されませんでした。HostとGuestを同じ版にしてください。");
@@ -1246,6 +1267,7 @@ document.addEventListener("visibilitychange", () => {
 });
 
 document.body.classList.toggle("low-power", lowPower);
+if (element.protocolVersion) element.protocolVersion.textContent = PROTOCOL_VERSION;
 element.url.value = addressFromPageUrl();
 element.name.value = "";
 refreshPads(true);
