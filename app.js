@@ -16,6 +16,9 @@ const NETWORK_FEEDBACK_INTERVAL_MS = 2_000;
 const MAX_INPUT_BUFFER_BYTES = 64 * 1024;
 const VIDEO_STALL_MS = 2_000;
 const VIDEO_STALL_REQUEST_COOLDOWN_MS = 3_000;
+const FAST_VIDEO_CHANNEL_LABEL = "video-fast";
+const FAST_VIDEO_OPEN_FALLBACK_MS = 1_200;
+const FAST_VIDEO_FIRST_FRAME_TIMEOUT_MS = 3_000;
 const NETWORK_MODES = ["auto", "ipv6_direct", "stun"];
 const MAX_EXTERNAL_POOL_CANDIDATES = 32;
 
@@ -63,6 +66,14 @@ const state = {
   peer: null,
   inputChannel: null,
   controlChannel: null,
+  fastVideoChannel: null,
+  fastVideoWorker: null,
+  fastVideoDisabled: false,
+  fastVideoFallbackTimer: null,
+  fastVideoFirstFrameTimer: null,
+  fastVideoTrack: null,
+  fastVideoReceiver: null,
+  fastVideoStats: null,
   videoStream: null,
   audioStream: null,
   remoteCandidates: [],
@@ -285,10 +296,13 @@ async function createPeer(generation, networkMode, stunServers) {
       if (generation !== state.generation) return;
       configureReceiverLatency(receiver);
       if (track.kind === "video") {
-        if (!startEncodedWebCodecsRenderer(receiver, track, generation) &&
-            !startLowLatencyVideoRenderer(track, generation)) {
-          startHtmlVideoFallback(track, generation);
-        }
+        state.fastVideoTrack = track;
+        state.fastVideoReceiver = receiver;
+        // Prefer the browser-only H.264 DataChannel path. Keep the negotiated
+        // RTP track idle as a compatibility fallback, but do not enter
+        // Chromium's video playout pipeline unless the fast channel fails.
+        if (state.fastVideoDisabled) startStoredVideoFallback(generation);
+        else scheduleVideoTrackFallback(generation);
       } else if (track.kind === "audio") {
         addTrackOnce(state.audioStream, track);
         if (!element.audioOut.muted) {
@@ -304,10 +318,16 @@ async function createPeer(generation, networkMode, stunServers) {
       maxPacketLifeTime: 50,
     });
     const control = peer.createDataChannel("control", { ordered: true });
+    const fastVideo = peer.createDataChannel(FAST_VIDEO_CHANNEL_LABEL, {
+      ordered: false,
+      maxRetransmits: 0,
+    });
     state.inputChannel = input;
     state.controlChannel = control;
+    state.fastVideoChannel = fastVideo;
     configureInputChannel(input, generation);
     configureControlChannel(control, generation);
+    configureFastVideoChannel(fastVideo, generation);
 
     const video = peer.addTransceiver("video", { direction: "recvonly" });
     preferH264(video);
@@ -339,6 +359,225 @@ function freshVideoCanvas() {
   element.videoCanvas.replaceWith(canvas);
   element.videoCanvas = canvas;
   return canvas;
+}
+
+
+function clearFastVideoTimers() {
+  clearTimeout(state.fastVideoFallbackTimer);
+  clearTimeout(state.fastVideoFirstFrameTimer);
+  state.fastVideoFallbackTimer = null;
+  state.fastVideoFirstFrameTimer = null;
+}
+
+function scheduleVideoTrackFallback(generation) {
+  clearTimeout(state.fastVideoFallbackTimer);
+  if (
+    generation !== state.generation ||
+    state.fastVideoDisabled ||
+    state.videoRenderer === "datachannel" ||
+    state.videoRenderer === "datachannel-pending"
+  ) return;
+  state.fastVideoFallbackTimer = setTimeout(() => {
+    if (
+      generation === state.generation &&
+      !state.fastVideoDisabled &&
+      state.videoRenderer !== "datachannel" &&
+      state.videoRenderer !== "datachannel-pending"
+    ) {
+      disableFastVideoAndFallback("fast video DataChannel did not open in time", generation);
+    }
+  }, FAST_VIDEO_OPEN_FALLBACK_MS);
+}
+
+function startStoredVideoFallback(generation) {
+  if (generation !== state.generation) return false;
+  const track = state.fastVideoTrack;
+  const receiver = state.fastVideoReceiver;
+  if (!track || !receiver) return false;
+  if (!startEncodedWebCodecsRenderer(receiver, track, generation) &&
+      !startLowLatencyVideoRenderer(track, generation)) {
+    startHtmlVideoFallback(track, generation);
+  }
+  return true;
+}
+
+function disableFastVideoAndFallback(reason, generation) {
+  if (generation !== state.generation) return;
+  console.warn("RemotePlay fast-video DataChannel disabled; using RTP fallback", reason);
+  state.fastVideoDisabled = true;
+  clearFastVideoTimers();
+  const channel = state.fastVideoChannel;
+  if (channel) {
+    channel.onmessage = null;
+    channel.onopen = null;
+    channel.onclose = null;
+    channel.onerror = null;
+    try { channel.close(); } catch (_) {}
+  }
+  state.fastVideoChannel = null;
+  if (state.fastVideoWorker) {
+    try { state.fastVideoWorker.postMessage({ type: "stop" }); } catch (_) {}
+    state.fastVideoWorker.terminate();
+    state.fastVideoWorker = null;
+  }
+  state.videoRenderer = "video";
+  state.previousInbound = null;
+  state.previousFeedback = null;
+  element.stage.classList.remove("low-latency-canvas");
+  if (element.videoCanvas) element.videoCanvas.hidden = true;
+  requestKeyframe("browser_fast_video_fallback");
+  if (!startStoredVideoFallback(generation)) {
+    // ontrack may not have fired yet. It will see fastVideoDisabled and start
+    // the ordinary track fallback when it arrives.
+    state.fastVideoFallbackTimer = setTimeout(() => startStoredVideoFallback(generation), 100);
+  }
+}
+
+function codecFromRemoteSdp() {
+  const sdp = state.peer?.remoteDescription?.sdp || "";
+  const profile = /profile-level-id=([0-9a-f]{6})/i.exec(sdp)?.[1];
+  return profile ? `avc1.${profile.toUpperCase()}` : "avc1.42E01F";
+}
+
+function configureFastVideoChannel(channel, generation) {
+  channel.binaryType = "arraybuffer";
+  channel.onopen = () => {
+    if (generation !== state.generation || state.fastVideoDisabled) return;
+    clearTimeout(state.fastVideoFallbackTimer);
+    state.fastVideoFallbackTimer = null;
+    if (!startFastDataVideoRenderer(channel, generation)) {
+      disableFastVideoAndFallback("fast-video WebCodecs renderer is unavailable", generation);
+    }
+  };
+  channel.onclose = () => {
+    if (generation !== state.generation || state.manual || state.fastVideoDisabled) return;
+    disableFastVideoAndFallback("fast video DataChannel closed", generation);
+  };
+  channel.onerror = () => {
+    if (generation !== state.generation || state.fastVideoDisabled) return;
+    disableFastVideoAndFallback("fast video DataChannel error", generation);
+  };
+}
+
+function startFastDataVideoRenderer(channel, generation) {
+  const canvas = freshVideoCanvas();
+  if (!canvas || typeof Worker !== "function" || !canvas.transferControlToOffscreen) return false;
+
+  let worker;
+  let offscreen;
+  try {
+    offscreen = canvas.transferControlToOffscreen();
+    canvas.dataset.transferred = "1";
+    worker = new Worker("data_video_worker.js?v=20260903-h264-dc1");
+  } catch (error) {
+    console.warn("Could not start fast-video worker", error);
+    return false;
+  }
+
+  if (state.fastVideoWorker && state.fastVideoWorker !== worker) {
+    try { state.fastVideoWorker.postMessage({ type: "stop" }); } catch (_) {}
+    state.fastVideoWorker.terminate();
+  }
+  state.fastVideoWorker = worker;
+  state.videoRenderer = "datachannel-pending";
+  state.fastVideoStats = {
+    receivedChunks: 0,
+    lostChunks: 0,
+    previousReceivedChunks: 0,
+    previousLostChunks: 0,
+    fps: 0,
+  };
+  let workerReady = false;
+  let firstFrameSeen = false;
+
+  channel.onmessage = (event) => {
+    if (
+      generation !== state.generation ||
+      state.fastVideoWorker !== worker ||
+      !(event.data instanceof ArrayBuffer)
+    ) return;
+    try {
+      worker.postMessage({ type: "chunk", buffer: event.data }, [event.data]);
+    } catch (error) {
+      disableFastVideoAndFallback(`could not forward video chunk to worker: ${error.message}`, generation);
+    }
+  };
+
+  worker.onmessage = ({ data }) => {
+    if (generation !== state.generation || state.fastVideoWorker !== worker) return;
+    if (data?.type === "ready") {
+      workerReady = true;
+      state.videoRenderer = "datachannel";
+      element.stage.classList.add("low-latency-canvas");
+      canvas.hidden = false;
+      element.display.textContent = "DC-WEBCODECS";
+      console.info(`RemotePlay H.264 unreliable DataChannel + WebCodecs active (${data.codec || "H.264"})`);
+      clearTimeout(state.fastVideoFirstFrameTimer);
+      state.fastVideoFirstFrameTimer = setTimeout(() => {
+        if (!firstFrameSeen) {
+          disableFastVideoAndFallback("fast-video channel produced no decodable frame", generation);
+        }
+      }, FAST_VIDEO_FIRST_FRAME_TIMEOUT_MS);
+      return;
+    }
+    if (data?.type === "request-keyframe") {
+      console.debug("RemotePlay fast-video worker requested recovery", data.reason || "unspecified");
+      requestKeyframe("browser_fast_video_loss");
+      return;
+    }
+    if (data?.type === "frame") {
+      firstFrameSeen = true;
+      clearTimeout(state.fastVideoFirstFrameTimer);
+      state.fastVideoFirstFrameTimer = null;
+      state.lastVideoFrameAt = performance.now();
+      state.lastDecodedFrameAt = state.lastVideoFrameAt;
+      if (!state.videoStarted) {
+        state.videoStarted = true;
+        element.stage.classList.add("has-video");
+        clearInterval(state.syncTimer);
+      }
+      if (data.width && data.height) {
+        element.resolution.textContent = `${data.width} × ${data.height}`;
+      }
+      const pipelineMs = Number(data.pipelineMs);
+      element.display.textContent = Number.isFinite(pipelineMs)
+        ? `DC ${Math.max(0, Math.round(pipelineMs))} ms`
+        : "DC-WEBCODECS";
+      const fps = Number(data.fps);
+      if (Number.isFinite(fps)) element.fps.textContent = `${Math.max(0, Math.round(fps))} fps`;
+      if (state.fastVideoStats) {
+        state.fastVideoStats.receivedChunks = Math.max(0, Number(data.receivedChunks) || 0);
+        state.fastVideoStats.lostChunks = Math.max(0, Number(data.lostChunks) || 0);
+        state.fastVideoStats.fps = Number.isFinite(fps) ? fps : state.fastVideoStats.fps;
+      }
+      element.loss.textContent = String(Math.max(0, Number(data.lostChunks) || 0));
+      element.buffer.textContent = "0 ms";
+      return;
+    }
+    if (data?.type === "error") {
+      disableFastVideoAndFallback(data.message || "fast-video worker error", generation);
+    }
+  };
+  worker.onerror = (event) => disableFastVideoAndFallback(event.message || "fast-video worker error", generation);
+
+  try {
+    worker.postMessage({ type: "start", canvas: offscreen, codec: codecFromRemoteSdp() }, [offscreen]);
+  } catch (error) {
+    worker.terminate();
+    state.fastVideoWorker = null;
+    return false;
+  }
+
+  setTimeout(() => {
+    if (
+      generation === state.generation &&
+      state.fastVideoWorker === worker &&
+      !workerReady
+    ) {
+      disableFastVideoAndFallback("fast-video worker initialization timed out", generation);
+    }
+  }, 2_000);
+  return true;
 }
 
 function startHtmlVideoFallback(track, generation) {
@@ -632,7 +871,12 @@ function configureInputChannel(channel, generation) {
   channel.onopen = () => {
     if (generation !== state.generation) return;
     sendInput({ type: "decoder_status", backend: "browser" });
-    requestInitialKeyframes(generation);
+    // The fast-video DataChannel needs its own first IDR. Avoid requesting an
+    // RTP-track IDR just before that channel opens; if the fast path fails, its
+    // fallback path explicitly requests a synchronization frame.
+    if (!state.fastVideoChannel || state.fastVideoDisabled) {
+      requestInitialKeyframes(generation);
+    }
     startPadPolling();
   };
   channel.onclose = () => {
@@ -987,6 +1231,7 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
   clearTimeout(state.welcomeTimer);
   clearTimeout(state.reconnectTimer);
   clearTimeout(state.retryTimer);
+  clearFastVideoTimers();
   clearInterval(state.statsTimer);
   clearInterval(state.syncTimer);
   if (state.padFrame !== null) cancelAnimationFrame(state.padFrame);
@@ -996,16 +1241,28 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
 
   const input = state.inputChannel;
   const control = state.controlChannel;
+  const fastVideo = state.fastVideoChannel;
   const peer = state.peer;
   const websocket = state.websocket;
   if (input) input.onclose = null;
   if (control) control.onclose = null;
+  if (fastVideo) {
+    fastVideo.onopen = null;
+    fastVideo.onmessage = null;
+    fastVideo.onclose = null;
+    fastVideo.onerror = null;
+  }
   if (peer) peer.onconnectionstatechange = null;
   if (websocket) websocket.onclose = null;
   input?.close();
   control?.close();
+  fastVideo?.close();
   peer?.close();
   websocket?.close();
+  if (state.fastVideoWorker) {
+    try { state.fastVideoWorker.postMessage({ type: "stop" }); } catch (_) {}
+    state.fastVideoWorker.terminate();
+  }
   if (state.videoTransformWorker) {
     try { state.videoTransformWorker.postMessage({ type: "stop" }); } catch (_) {}
     state.videoTransformWorker.terminate();
@@ -1023,6 +1280,14 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
     peer: null,
     inputChannel: null,
     controlChannel: null,
+    fastVideoChannel: null,
+    fastVideoWorker: null,
+    fastVideoDisabled: false,
+    fastVideoFallbackTimer: null,
+    fastVideoFirstFrameTimer: null,
+    fastVideoTrack: null,
+    fastVideoReceiver: null,
+    fastVideoStats: null,
     videoStream: null,
     audioStream: null,
     remoteCandidates: [],
@@ -1098,7 +1363,7 @@ function resyncVideo() {
     element.video.playbackRate = 1;
     element.video.play().catch(onVideoAutoplayBlocked);
   }
-  if (state.videoRenderer === "webcodecs") {
+  if (state.videoRenderer === "webcodecs" || state.videoRenderer === "datachannel") {
     requestKeyframe("browser_manual_start");
   }
   requestSyncFrame("browser_manual_start");
@@ -1193,10 +1458,14 @@ async function updateStats() {
       }
     }
 
-    if (!inbound) return;
-    element.loss.textContent = String(inbound.packetsLost || 0);
-    updateInboundMetrics(inbound);
-    sendNetworkFeedbackIfDue(inbound);
+    if (state.videoRenderer === "datachannel") {
+      sendFastVideoNetworkFeedbackIfDue();
+    } else {
+      if (!inbound) return;
+      element.loss.textContent = String(inbound.packetsLost || 0);
+      updateInboundMetrics(inbound);
+      sendNetworkFeedbackIfDue(inbound);
+    }
 
     const now = performance.now();
     if (
@@ -1259,6 +1528,25 @@ function updateInboundMetrics(inbound) {
     decodeTime: inbound.totalDecodeTime || 0,
     dropped: inbound.framesDropped || 0,
   };
+}
+
+
+function sendFastVideoNetworkFeedbackIfDue() {
+  const stats = state.fastVideoStats;
+  if (!stats) return;
+  const now = performance.now();
+  if (now < state.nextFeedbackAt) return;
+  const received = Math.max(0, stats.receivedChunks - stats.previousReceivedChunks);
+  const lost = Math.max(0, stats.lostChunks - stats.previousLostChunks);
+  sendInput({
+    type: "network_feedback",
+    received_packets: received,
+    lost_packets: lost,
+    jitter_ms: 0,
+  });
+  stats.previousReceivedChunks = stats.receivedChunks;
+  stats.previousLostChunks = stats.lostChunks;
+  state.nextFeedbackAt = now + NETWORK_FEEDBACK_INTERVAL_MS;
 }
 
 function sendNetworkFeedbackIfDue(inbound) {
