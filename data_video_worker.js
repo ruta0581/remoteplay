@@ -8,7 +8,13 @@ const MAX_CHUNKS = 4096;
 const MAX_ASSEMBLIES = 4;
 const FRAME_GAP_GRACE_MS = 6;
 const KEYFRAME_GAP_GRACE_MS = 25;
+const INCOMPLETE_KEYFRAME_TIMEOUT_MS = 500;
 const MAX_DECODER_QUEUE = 2;
+// A delayed P-frame cannot be skipped independently because later H.264
+// frames may reference it. Once the dependency chain is visibly old, abandon
+// it and resume at a fresh IDR instead of decoding toward live video.
+const MIN_CAPTURE_AGE_LIMIT_MS = 180;
+const MAX_CAPTURE_AGE_LIMIT_MS = 300;
 const REPORT_INTERVAL_MS = 250;
 const DEFAULT_CODEC = "avc1.42E01F";
 const ANNEX_B_START_CODE = new Uint8Array([0, 0, 0, 1]);
@@ -25,6 +31,8 @@ let drawQueued = false;
 let assemblies = new Map();
 let lastDecodedFrameId = null;
 let gapTimer = null;
+let incompleteKeyframeTimer = null;
+let incompleteKeyframeFrameId = null;
 let cachedParameterSets = [];
 let arrivalByTimestamp = new Map();
 let decodedFrames = 0;
@@ -33,6 +41,7 @@ let decoderResets = 0;
 let receivedChunks = 0;
 let lostChunks = 0;
 let droppedAssemblies = 0;
+let droppedStaleFrames = 0;
 let lastReportAt = 0;
 let fpsWindowStartedAt = performance.now();
 let fpsWindowFrames = 0;
@@ -196,6 +205,23 @@ function closePendingFrame() {
   pendingFrame = null;
 }
 
+function captureAgeLimitMs() {
+  // Keep enough margin for the best measured RTT and clock-offset error while
+  // still preventing a browser/SCTP backlog from turning into playout delay.
+  const rttMargin = Number.isFinite(clockSyncRttMs) ? Math.max(0, clockSyncRttMs) : 60;
+  return Math.min(MAX_CAPTURE_AGE_LIMIT_MS, Math.max(MIN_CAPTURE_AGE_LIMIT_MS, 120 + rttMargin));
+}
+
+function captureAgeMs(capturedUnixMs) {
+  if (!Number.isFinite(clockOffsetMs) || !Number.isFinite(capturedUnixMs)) return null;
+  return Date.now() - (capturedUnixMs + clockOffsetMs);
+}
+
+function frameIsStale(capturedUnixMs) {
+  const ageMs = captureAgeMs(capturedUnixMs);
+  return Number.isFinite(ageMs) && ageMs > captureAgeLimitMs();
+}
+
 function reportFrame(frame, timing) {
   const width = frame.displayWidth || frame.codedWidth;
   const height = frame.displayHeight || frame.codedHeight;
@@ -243,6 +269,7 @@ function reportFrame(frame, timing) {
       receivedChunks,
       lostChunks,
       droppedAssemblies,
+      droppedStaleFrames,
       pendingAssemblies: assemblies.size,
       pendingAssemblyBytes: 0,
       format: lastFormat,
@@ -282,6 +309,15 @@ function onDecodedFrame(frame) {
     encodedUnixMs: null,
   };
   arrivalByTimestamp.delete(frame.timestamp);
+  if (frameIsStale(timing.capturedUnixMs)) {
+    droppedStaleFrames += 1;
+    frame.close();
+    // A stale keyframe is still useful as a decoder reference and can be
+    // hidden while fresh dependent frames catch up. A stale delta means the
+    // whole dependency chain is late, so restart it at a new IDR.
+    if (!timing.keyframe) resetForLoss("browser_fast_video_stale_decoded_frame");
+    return;
+  }
   pendingFrame = { frame, timing };
   if (!drawQueued) {
     drawQueued = true;
@@ -309,6 +345,26 @@ function clearGapTimer() {
   gapTimer = null;
 }
 
+function clearIncompleteKeyframeTimer() {
+  if (incompleteKeyframeTimer !== null) clearTimeout(incompleteKeyframeTimer);
+  incompleteKeyframeTimer = null;
+  incompleteKeyframeFrameId = null;
+}
+
+function armIncompleteKeyframeTimer(frameId) {
+  clearIncompleteKeyframeTimer();
+  incompleteKeyframeFrameId = frameId;
+  incompleteKeyframeTimer = setTimeout(() => {
+    incompleteKeyframeTimer = null;
+    const expectedFrameId = incompleteKeyframeFrameId;
+    incompleteKeyframeFrameId = null;
+    if (stopped || !waitingForKeyframe) return;
+    const assembly = assemblies.get(expectedFrameId);
+    if (!assembly || assembly.complete) return;
+    resetForLoss("browser_fast_video_incomplete_keyframe");
+  }, INCOMPLETE_KEYFRAME_TIMEOUT_MS);
+}
+
 function dropAssembly(assembly, countLoss = true) {
   if (!assembly) return;
   assemblies.delete(assembly.frameId);
@@ -319,6 +375,7 @@ function dropAssembly(assembly, countLoss = true) {
 function resetForLoss(reason) {
   waitingForKeyframe = true;
   clearGapTimer();
+  clearIncompleteKeyframeTimer();
   for (const assembly of assemblies.values()) dropAssembly(assembly, true);
   assemblies.clear();
   closePendingFrame();
@@ -347,6 +404,7 @@ function isAhead(a, b) {
 
 async function decodeAssembly(assembly) {
   assemblies.delete(assembly.frameId);
+  if (assembly.keyframe) clearIncompleteKeyframeTimer();
   let converted;
   try {
     converted = normalizeAccessUnit(assembly.data);
@@ -365,6 +423,11 @@ async function decodeAssembly(assembly) {
   }
 
   if (waitingForKeyframe && !key) return false;
+  if (!key && frameIsStale(assembly.capturedUnixMs)) {
+    droppedStaleFrames += 1;
+    resetForLoss("browser_fast_video_stale_encoded_frame");
+    return false;
+  }
   if (key && metadata.codec && decoderConfig?.codec !== metadata.codec) {
     const config = await supportedConfig(metadata.codec);
     createDecoder(config);
@@ -386,6 +449,7 @@ async function decodeAssembly(assembly) {
     completeAt: assembly.completeAt || performance.now(),
     capturedUnixMs: assembly.capturedUnixMs,
     encodedUnixMs: assembly.encodedUnixMs,
+    keyframe: key,
   });
   try {
     decoder.decode(new EncodedVideoChunk({
@@ -506,6 +570,13 @@ function onChunk(buffer) {
 
   let assembly = assemblies.get(chunk.frameId);
   if (!assembly) {
+    if (waitingForKeyframe && chunk.keyframe) {
+      // If a newer recovery IDR starts arriving, the older incomplete one can
+      // no longer lead to the freshest decodable chain.
+      for (const current of [...assemblies.values()]) {
+        if (current.keyframe && current.frameId !== chunk.frameId) dropAssembly(current, true);
+      }
+    }
     assembly = {
       frameId: chunk.frameId,
       keyframe: chunk.keyframe,
@@ -521,6 +592,7 @@ function onChunk(buffer) {
       complete: false,
     };
     assemblies.set(chunk.frameId, assembly);
+    if (waitingForKeyframe && chunk.keyframe) armIncompleteKeyframeTimer(chunk.frameId);
   }
   if (
     assembly.frameSize !== chunk.frameSize ||
@@ -540,6 +612,7 @@ function onChunk(buffer) {
     if (assembly.receivedCount === assembly.chunkCount) {
       assembly.complete = true;
       assembly.completeAt = performance.now();
+      if (assembly.keyframe) clearIncompleteKeyframeTimer();
     }
   }
 
@@ -572,6 +645,7 @@ async function start(data) {
 function stop() {
   stopped = true;
   clearGapTimer();
+  clearIncompleteKeyframeTimer();
   closePendingFrame();
   for (const assembly of assemblies.values()) dropAssembly(assembly, false);
   assemblies.clear();

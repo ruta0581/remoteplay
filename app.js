@@ -514,7 +514,7 @@ function startFastDataVideoRenderer(channel, generation) {
   try {
     offscreen = canvas.transferControlToOffscreen();
     canvas.dataset.transferred = "1";
-    worker = new Worker("data_video_worker.js?v=20260905-lowlatency-opt");
+    worker = new Worker("data_video_worker.js?v=20260906-freshness-drop");
   } catch (error) {
     debugWarn("Could not start fast-video worker", error);
     return false;
