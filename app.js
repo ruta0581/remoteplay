@@ -5,6 +5,7 @@
 const PROTOCOL_VERSION = "1";
 
 const CONNECTION_TIMEOUT_MS = 45_000;
+const ICE_ROUTE_TIMEOUT_MS = 4_000;
 const WELCOME_TIMEOUT_MS = 10_000;
 const AUDIO_JITTER_TARGET_MS = 20;
 const VIDEO_JITTER_TARGET_MS = 0;
@@ -1165,6 +1166,17 @@ async function handleSignal(raw, generation) {
           debugWarn("Host external STUN candidate was rejected", candidate.candidate, error);
         }
       }
+      clearTimeout(state.connectionTimer);
+      state.connectionTimer = setTimeout(() => {
+        const iceState = state.peer?.iceConnectionState;
+        if (
+          generation === state.generation &&
+          !state.connected &&
+          (iceState === "new" || iceState === "checking")
+        ) {
+          void fail("IPv4 STUN経路を確立できませんでした。");
+        }
+      }, ICE_ROUTE_TIMEOUT_MS);
       break;
     case "candidate":
       if (!state.peer || !message.candidate) return;
