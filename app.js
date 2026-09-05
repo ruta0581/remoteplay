@@ -21,6 +21,14 @@ const FAST_VIDEO_OPEN_FALLBACK_MS = 1_200;
 const FAST_VIDEO_FIRST_FRAME_TIMEOUT_MS = 3_000;
 const NETWORK_MODES = ["auto", "ipv6_direct", "stun"];
 const MAX_EXTERNAL_POOL_CANDIDATES = 32;
+const DEBUG_LOGGING = new URLSearchParams(window.location.search).get("debug") === "1";
+
+const debugLog = (...args) => {
+  if (DEBUG_LOGGING) console.debug(...args);
+};
+const debugWarn = (...args) => {
+  if (DEBUG_LOGGING) console.warn(...args);
+};
 
 const byId = (id) => document.getElementById(id);
 const element = {
@@ -53,6 +61,13 @@ const element = {
   display: byId("display"),
   resolution: byId("resolution"),
   protocolVersion: byId("protocolVersion"),
+};
+
+const virtualGamepadState = {
+  id: "RemotePlay Mobile Digital Pad",
+  mapping: "standard",
+  buttons: Array.from({ length: 16 }, () => ({ pressed: false, value: 0 })),
+  axes: new Float32Array(4),
 };
 
 const lowPower =
@@ -187,7 +202,7 @@ function sendChannel(channel, payload, bounded = true) {
     channel.send(JSON.stringify(payload));
     return true;
   } catch (error) {
-    console.warn("DataChannel send failed", error);
+    debugWarn("DataChannel send failed", error);
     return false;
   }
 }
@@ -216,7 +231,7 @@ function configureReceiverLatency(receiver) {
         receiver.jitterBufferTarget = AUDIO_JITTER_TARGET_MS;
       }
     } catch (error) {
-      console.debug(`audio jitterBufferTarget=${AUDIO_JITTER_TARGET_MS} was rejected`, error);
+      debugLog(`audio jitterBufferTarget=${AUDIO_JITTER_TARGET_MS} was rejected`, error);
     }
     return;
   }
@@ -232,7 +247,7 @@ function configureReceiverLatency(receiver) {
       configured = true;
     }
   } catch (error) {
-    console.debug(`video jitterBufferTarget=${VIDEO_JITTER_TARGET_MS} was rejected`, error);
+    debugLog(`video jitterBufferTarget=${VIDEO_JITTER_TARGET_MS} was rejected`, error);
   }
   if (!configured) {
     try {
@@ -240,7 +255,7 @@ function configureReceiverLatency(receiver) {
         receiver.playoutDelayHint = VIDEO_PLAYOUT_DELAY_SECONDS;
       }
     } catch (error) {
-      console.debug(`video playoutDelayHint=${VIDEO_PLAYOUT_DELAY_SECONDS} was rejected`, error);
+      debugLog(`video playoutDelayHint=${VIDEO_PLAYOUT_DELAY_SECONDS} was rejected`, error);
     }
   }
 }
@@ -257,7 +272,7 @@ function preferH264(transceiver) {
       transceiver.setCodecPreferences([...preferred, ...remaining]);
     }
   } catch (error) {
-    console.warn("H.264 codec preference was rejected", error);
+    debugWarn("H.264 codec preference was rejected", error);
   }
 }
 
@@ -405,7 +420,7 @@ function startStoredVideoFallback(generation) {
 
 function disableFastVideoAndFallback(reason, generation) {
   if (generation !== state.generation) return;
-  console.warn("RemotePlay fast-video DataChannel disabled; using RTP fallback", reason);
+  debugWarn("RemotePlay fast-video DataChannel disabled; using RTP fallback", reason);
   state.fastVideoDisabled = true;
   clearFastVideoTimers();
   const channel = state.fastVideoChannel;
@@ -470,9 +485,9 @@ function startFastDataVideoRenderer(channel, generation) {
   try {
     offscreen = canvas.transferControlToOffscreen();
     canvas.dataset.transferred = "1";
-    worker = new Worker("data_video_worker.js?v=20260903-h264-dc4");
+    worker = new Worker("data_video_worker.js?v=20260905-lowlatency-opt");
   } catch (error) {
-    console.warn("Could not start fast-video worker", error);
+    debugWarn("Could not start fast-video worker", error);
     return false;
   }
 
@@ -518,7 +533,7 @@ function startFastDataVideoRenderer(channel, generation) {
       element.stage.classList.add("low-latency-canvas");
       canvas.hidden = false;
       element.display.textContent = "DC-WEBCODECS";
-      console.info(`RemotePlay H.264 unreliable DataChannel + WebCodecs active (${data.codec || "H.264"})`);
+      debugLog(`RemotePlay H.264 unreliable DataChannel + WebCodecs active (${data.codec || "H.264"})`);
       clearTimeout(state.fastVideoFirstFrameTimer);
       state.fastVideoFirstFrameTimer = setTimeout(() => {
         if (!firstFrameSeen) {
@@ -528,7 +543,7 @@ function startFastDataVideoRenderer(channel, generation) {
       return;
     }
     if (data?.type === "request-keyframe") {
-      console.debug("RemotePlay fast-video worker requested recovery", data.reason || "unspecified");
+      debugLog("RemotePlay fast-video worker requested recovery", data.reason || "unspecified");
       requestKeyframe("browser_fast_video_loss");
       return;
     }
@@ -570,8 +585,8 @@ function startFastDataVideoRenderer(channel, generation) {
         state.fastVideoStats.captureToDisplayMs = Number.isFinite(captureToDisplayMs) ? captureToDisplayMs : null;
         state.fastVideoStats.pipelineMs = Number.isFinite(pipelineMs) ? pipelineMs : null;
       }
-      if (Number.isFinite(captureToDisplayMs) || Number.isFinite(pipelineMs)) {
-        console.debug("RemotePlay fast-video latency", {
+      if (DEBUG_LOGGING && (Number.isFinite(captureToDisplayMs) || Number.isFinite(pipelineMs))) {
+        debugLog("RemotePlay fast-video latency", {
           captureToDisplayMs: Number.isFinite(captureToDisplayMs) ? captureToDisplayMs : null,
           encodedToDisplayMs: Number.isFinite(encodedToDisplayMs) ? encodedToDisplayMs : null,
           dataChannelToDisplayMs: Number.isFinite(pipelineMs) ? pipelineMs : null,
@@ -596,6 +611,7 @@ function startFastDataVideoRenderer(channel, generation) {
       type: "start",
       canvas: offscreen,
       codec: codecFromRemoteSdp(),
+      debugLogging: DEBUG_LOGGING,
       clockOffsetMs: state.clockOffsetMs,
       clockSyncRttMs: state.clockSyncBestRttMs,
     }, [offscreen]);
@@ -636,7 +652,7 @@ function negotiatedH264Codec(receiver) {
     const profile = /(?:^|;)\s*profile-level-id=([0-9a-f]{6})/i.exec(h264?.sdpFmtpLine || "")?.[1];
     if (profile) return `avc1.${profile.toUpperCase()}`;
   } catch (error) {
-    console.debug("Could not read negotiated H.264 profile for WebCodecs", error);
+    debugLog("Could not read negotiated H.264 profile for WebCodecs", error);
   }
   return "avc1.42E01F";
 }
@@ -658,7 +674,7 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
   try {
     offscreen = canvas.transferControlToOffscreen();
     canvas.dataset.transferred = "1";
-    worker = new Worker("encoded_video_worker.js?v=20260903-webcodecs-rxfix");
+    worker = new Worker("encoded_video_worker.js?v=20260905-lowlatency-opt");
     const codec = negotiatedH264Codec(receiver);
     receiver.transform = new RTCRtpScriptTransform(
       worker,
@@ -666,11 +682,12 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
         name: "remoteplay-webcodecs-video",
         canvas: offscreen,
         codec,
+        debugLogging: DEBUG_LOGGING,
       },
       [offscreen],
     );
   } catch (error) {
-    console.warn("Encoded Transform + WebCodecs renderer is unavailable", error);
+    debugWarn("Encoded Transform + WebCodecs renderer is unavailable", error);
     try { worker?.terminate(); } catch (_) {}
     return false;
   }
@@ -700,7 +717,7 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
     ) return;
     fallbackStarted = true;
     clearFirstFrameTimer();
-    console.warn("Encoded Transform + WebCodecs renderer failed; using decoded-track fallback", error);
+    debugWarn("Encoded Transform + WebCodecs renderer failed; using decoded-track fallback", error);
 
     // Do not terminate or detach a receiver transform after it has entered the
     // receive pipeline. Keep the worker alive as an immediate pass-through;
@@ -720,7 +737,7 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
     if (data?.type === "ready") {
       workerReady = true;
       state.videoRenderer = "webcodecs";
-      console.info(`RemotePlay Encoded Transform + WebCodecs renderer active (${data.codec || "H.264"})`);
+      debugLog(`RemotePlay Encoded Transform + WebCodecs renderer active (${data.codec || "H.264"})`);
       element.stage.classList.add("low-latency-canvas");
       canvas.hidden = false;
       element.display.textContent = "WEBCODECS";
@@ -731,7 +748,7 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
       return;
     }
     if (data?.type === "diagnostic") {
-      console.debug("RemotePlay WebCodecs receiver frame", data);
+      debugLog("RemotePlay WebCodecs receiver frame", data);
       return;
     }
     if (data?.type === "request-keyframe") {
@@ -755,8 +772,8 @@ function startEncodedWebCodecsRenderer(receiver, track, generation) {
       element.display.textContent = Number.isFinite(pipelineMs)
         ? `WC ${Math.max(0, Math.round(pipelineMs))} ms`
         : "WEBCODECS";
-      if (Number.isFinite(pipelineMs) && pipelineMs >= 80) {
-        console.debug("RemotePlay WebCodecs render pipeline is behind", {
+      if (DEBUG_LOGGING && Number.isFinite(pipelineMs) && pipelineMs >= 80) {
+        debugLog("RemotePlay WebCodecs render pipeline is behind", {
           pipelineMs,
           decoderQueue: data.decoderQueue,
           decodeResets: data.decodeResets,
@@ -795,7 +812,7 @@ function startLowLatencyVideoRenderer(track, generation) {
     canvas.dataset.transferred = "1";
     worker = new Worker("video_worker.js?v=20260903-lowlatency-canvas");
   } catch (error) {
-    console.warn("Low-latency video renderer is unavailable; using HTMLVideoElement", error);
+    debugWarn("Low-latency video renderer is unavailable; using HTMLVideoElement", error);
     try { renderTrack?.stop(); } catch (_) {}
     return false;
   }
@@ -807,7 +824,7 @@ function startLowLatencyVideoRenderer(track, generation) {
 
   const fallback = (error) => {
     if (generation !== state.generation || state.videoWorker !== worker) return;
-    console.warn("Low-latency canvas renderer failed; falling back to HTMLVideoElement", error);
+    debugWarn("Low-latency canvas renderer failed; falling back to HTMLVideoElement", error);
     worker.terminate();
     state.videoWorker = null;
     state.videoRenderer = "video";
@@ -819,7 +836,7 @@ function startLowLatencyVideoRenderer(track, generation) {
     if (data?.type === "ready") {
       workerReady = true;
       state.videoRenderer = "canvas";
-      console.info("RemotePlay low-latency canvas renderer active");
+      debugLog("RemotePlay low-latency canvas renderer active");
       element.stage.classList.add("low-latency-canvas");
       canvas.hidden = false;
       return;
@@ -965,7 +982,7 @@ function configureControlChannel(channel, generation) {
         await stop(false, message.reason || "ホストから切断されました");
       }
     } catch (error) {
-      console.warn("Unknown reliable control message", error);
+      debugWarn("Unknown reliable control message", error);
     }
   };
   channel.onclose = () => {
@@ -1101,7 +1118,7 @@ async function handleSignal(raw, generation) {
           await state.peer.addIceCandidate(candidate);
         } catch (error) {
           if (!candidate._remotePlayExternal) throw error;
-          console.warn("Host external STUN candidate was rejected", candidate.candidate, error);
+          debugWarn("Host external STUN candidate was rejected", candidate.candidate, error);
         }
       }
       break;
@@ -1120,7 +1137,7 @@ async function handleSignal(raw, generation) {
           try {
             await state.peer.addIceCandidate(candidate);
           } catch (error) {
-            console.warn("Host external STUN candidate was rejected", candidate.candidate, error);
+            debugWarn("Host external STUN candidate was rejected", candidate.candidate, error);
           }
         } else {
           state.remoteCandidates.push(candidate);
@@ -1411,12 +1428,12 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
 }
 
 function onVideoAutoplayBlocked(error) {
-  console.warn("Video autoplay was blocked", error);
+  debugWarn("Video autoplay was blocked", error);
   element.error.textContent = "映像をクリックすると再生を開始できます。";
 }
 
 function onAudioAutoplayBlocked(error) {
-  console.warn("Audio autoplay was blocked", error);
+  debugWarn("Audio autoplay was blocked", error);
   element.audioOut.muted = true;
   element.audio.textContent = "音声 OFF";
   element.error.textContent = "音声を再生するには「音声 OFF」を一度押してください。";
@@ -1545,7 +1562,7 @@ async function updateStats() {
       requestKeyframe("browser_video_stalled");
     }
   } catch (error) {
-    console.warn("WebRTC stats failed", error);
+    debugWarn("WebRTC stats failed", error);
   }
 }
 
@@ -1570,8 +1587,8 @@ function updateInboundMetrics(inbound) {
     if (emitted > 0 && delay >= 0) {
       element.buffer.textContent = `${Math.round((delay / emitted) * 1_000)} ms`;
     }
-    if (emitted > 0 || decoded > 0 || dropped > 0) {
-      console.debug("RemotePlay video playout stats", {
+    if (DEBUG_LOGGING && (emitted > 0 || decoded > 0 || dropped > 0)) {
+      debugLog("RemotePlay video playout stats", {
         jitterMs: emitted > 0 && delay >= 0 ? (delay / emitted) * 1_000 : null,
         jitterMinimumMs: emitted > 0 && minimumDelay >= 0 ? (minimumDelay / emitted) * 1_000 : null,
         jitterTargetMs: emitted > 0 && targetDelay >= 0 ? (targetDelay / emitted) * 1_000 : null,
@@ -1696,12 +1713,13 @@ function gamepadPayload(pad, connected = true) {
 }
 
 function virtualPad() {
-  return {
-    id: "RemotePlay Mobile Digital Pad",
-    mapping: "standard",
-    buttons: state.virtualButtons.map((value) => ({ pressed: value > 0, value })),
-    axes: [0, 0, 0, 0],
-  };
+  for (let index = 0; index < virtualGamepadState.buttons.length; index += 1) {
+    const value = state.virtualButtons[index] || 0;
+    const button = virtualGamepadState.buttons[index];
+    button.pressed = value > 0;
+    button.value = value;
+  }
+  return virtualGamepadState;
 }
 
 function encodedButton(button) {

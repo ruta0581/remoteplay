@@ -6,9 +6,11 @@ const KEYFRAME_REQUEST_COOLDOWN_MS = 500;
 const REPORT_INTERVAL_MS = 250;
 const MAX_FORMAT_FAILURES = 4;
 const MAX_DECODER_FAILURES = 3;
+const ANNEX_B_START_CODE = new Uint8Array([0, 0, 0, 1]);
 
 let stopped = false;
 let passthroughOnly = false;
+let debugLogging = false;
 let transformerRef = null;
 let decoder = null;
 let decoderConfig = null;
@@ -36,6 +38,14 @@ function errorMessage(error) {
 
 function postError(error) {
   self.postMessage({ type: "error", message: errorMessage(error) });
+}
+
+function debugLog(...args) {
+  if (debugLogging) console.debug(...args);
+}
+
+function debugWarn(...args) {
+  if (debugLogging) console.warn(...args);
 }
 
 function requestKeyframe(reason) {
@@ -80,30 +90,12 @@ function concatNals(nals) {
   const out = new Uint8Array(total);
   let offset = 0;
   for (const nal of nals) {
-    out.set([0, 0, 0, 1], offset);
+    out.set(ANNEX_B_START_CODE, offset);
     offset += 4;
     out.set(nal, offset);
     offset += nal.byteLength;
   }
   return out;
-}
-
-function normalizeAnnexB(data) {
-  const nals = [];
-  let offset = 0;
-  while (offset < data.byteLength) {
-    let sc = startCodeLengthAt(data, offset);
-    if (!sc) {
-      offset += 1;
-      continue;
-    }
-    const nalStart = offset + sc;
-    let next = nalStart;
-    while (next < data.byteLength && !startCodeLengthAt(data, next)) next += 1;
-    if (next > nalStart) nals.push(data.slice(nalStart, next));
-    offset = next;
-  }
-  return nals.length ? concatNals(nals) : null;
 }
 
 function tryLengthPrefixed(data, lengthBytes) {
@@ -155,8 +147,9 @@ function copyReceiverH264AsAnnexB(encodedFrame) {
   if (!source.byteLength) throw new Error("received an empty H.264 encoded frame");
 
   if (isAnnexB(source)) {
-    const normalized = normalizeAnnexB(source);
-    if (normalized) return { data: normalized, format: "annexb" };
+    // Receiver frames from this Host are already decoder-ready Annex B. Keep
+    // the ArrayBuffer view and avoid another full-frame allocation and copy.
+    return { data: source, format: "annexb" };
   }
 
   // Some implementations expose decoder-ready AVCC. Try the common length
@@ -321,7 +314,7 @@ function createDecoder(config) {
     output: onDecodedFrame,
     error(error) {
       decoderFailures += 1;
-      console.warn("RemotePlay WebCodecs decoder error", error);
+      debugWarn("RemotePlay WebCodecs decoder error", error);
       waitingForKeyframe = true;
       requestKeyframe("webcodecs_decoder_error");
       if (decoderFailures >= MAX_DECODER_FAILURES) {
@@ -357,14 +350,17 @@ function prepareEncodedFrame(encodedFrame) {
   let data = converted.data;
   let metadata = h264Metadata(data);
   const isKey = encodedFrame.type === "key" || metadata.key;
-  data = prependCachedParameterSets(data, metadata, isKey);
-  metadata = h264Metadata(data);
+  const preparedData = prependCachedParameterSets(data, metadata, isKey);
+  if (preparedData !== data) {
+    data = preparedData;
+    metadata = h264Metadata(data);
+  }
   const timestamp = Number.isFinite(encodedFrame.timestamp)
     ? Number(encodedFrame.timestamp)
     : Math.max(latestChunkTimestamp + 1, Math.round(performance.now() * 1000));
   latestChunkTimestamp = Math.max(latestChunkTimestamp, timestamp);
 
-  if (diagnosticFrames < 4) {
+  if (debugLogging && diagnosticFrames < 4) {
     diagnosticFrames += 1;
     let rtcMetadata = {};
     try { rtcMetadata = encodedFrame.getMetadata?.() || {}; } catch (_) {}
@@ -396,7 +392,7 @@ function decodePrepared(prepared) {
       waitingForKeyframe = true;
       self.postMessage({ type: "diagnostic", codecReconfigured: metadata.codec });
     } catch (error) {
-      console.debug("SPS-derived WebCodecs profile reconfigure failed", error);
+      debugLog("SPS-derived WebCodecs profile reconfigure failed", error);
     }
   }
 
@@ -418,7 +414,7 @@ function decodePrepared(prepared) {
     formatFailures = 0;
   } catch (error) {
     arrivalByTimestamp.delete(timestamp);
-    console.warn("RemotePlay WebCodecs decode() rejected a frame", error);
+    debugWarn("RemotePlay WebCodecs decode() rejected a frame", error);
     resetForCatchup("webcodecs_decode_rejected");
   }
 }
@@ -430,6 +426,7 @@ function startTransform(transformer) {
 
   transformerRef = transformer;
   const options = transformer.options || {};
+  debugLogging = options.debugLogging === true;
   canvas = options.canvas || null;
   if (!canvas) throw new Error("Encoded Transform did not receive an OffscreenCanvas");
   context = canvas.getContext("2d", { alpha: false, desynchronized: true });
@@ -445,7 +442,7 @@ function startTransform(transformer) {
           prepared = prepareEncodedFrame(encodedFrame);
         } catch (error) {
           formatFailures += 1;
-          if (formatFailures <= MAX_FORMAT_FAILURES) {
+          if (debugLogging && formatFailures <= MAX_FORMAT_FAILURES) {
             self.postMessage({ type: "diagnostic", formatError: errorMessage(error) });
           }
           if (formatFailures >= MAX_FORMAT_FAILURES) {

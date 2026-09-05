@@ -11,8 +11,10 @@ const KEYFRAME_GAP_GRACE_MS = 25;
 const MAX_DECODER_QUEUE = 2;
 const REPORT_INTERVAL_MS = 250;
 const DEFAULT_CODEC = "avc1.42E01F";
+const ANNEX_B_START_CODE = new Uint8Array([0, 0, 0, 1]);
 
 let stopped = false;
+let debugLogging = false;
 let canvas = null;
 let context = null;
 let decoder = null;
@@ -46,6 +48,10 @@ function postError(error) {
   self.postMessage({ type: "error", message: errorMessage(error) });
 }
 
+function debugWarn(...args) {
+  if (debugLogging) console.warn(...args);
+}
+
 function requestKeyframe(reason) {
   self.postMessage({ type: "request-keyframe", reason });
 }
@@ -73,18 +79,12 @@ function concatNals(nals) {
   const out = new Uint8Array(total);
   let offset = 0;
   for (const nal of nals) {
-    out.set([0, 0, 0, 1], offset);
+    out.set(ANNEX_B_START_CODE, offset);
     offset += 4;
     out.set(nal, offset);
     offset += nal.byteLength;
   }
   return out;
-}
-
-function normalizeAnnexB(data) {
-  const nals = [];
-  forEachAnnexBNal(data, (nal) => nals.push(nal.slice()));
-  return nals.length ? concatNals(nals) : null;
 }
 
 function tryLengthPrefixed(data, lengthBytes) {
@@ -107,8 +107,9 @@ function tryLengthPrefixed(data, lengthBytes) {
 function normalizeAccessUnit(source) {
   if (!source.byteLength) throw new Error("received an empty H.264 access unit");
   if (isAnnexB(source)) {
-    const normalized = normalizeAnnexB(source);
-    if (normalized) return { data: normalized, format: "annexb" };
+    // The Host already sends complete Annex-B access units. Keep the assembled
+    // buffer instead of copying the full encoded frame once more before decode.
+    return { data: source, format: "annexb" };
   }
   for (const lengthBytes of [4, 2, 1]) {
     const converted = tryLengthPrefixed(source, lengthBytes);
@@ -208,19 +209,19 @@ function reportFrame(frame, timing) {
   renderedFrames += 1;
   fpsWindowFrames += 1;
   const nowPerf = performance.now();
-  const nowWall = Date.now();
-  const elapsed = Math.max(1, nowPerf - fpsWindowStartedAt);
-  const fps = (fpsWindowFrames * 1000) / elapsed;
-  const pipelineMs = Math.max(0, nowPerf - timing.firstArrivalAt);
-  const assemblyMs = Math.max(0, timing.completeAt - timing.firstArrivalAt);
-  const captureToDisplayMs = Number.isFinite(clockOffsetMs) && Number.isFinite(timing.capturedUnixMs)
-    ? Math.max(0, nowWall - (timing.capturedUnixMs + clockOffsetMs))
-    : null;
-  const encodedToDisplayMs = Number.isFinite(clockOffsetMs) && Number.isFinite(timing.encodedUnixMs)
-    ? Math.max(0, nowWall - (timing.encodedUnixMs + clockOffsetMs))
-    : null;
   if (nowPerf - lastReportAt >= REPORT_INTERVAL_MS || renderedFrames === 1) {
     lastReportAt = nowPerf;
+    const nowWall = Date.now();
+    const elapsed = Math.max(1, nowPerf - fpsWindowStartedAt);
+    const fps = (fpsWindowFrames * 1000) / elapsed;
+    const pipelineMs = Math.max(0, nowPerf - timing.firstArrivalAt);
+    const assemblyMs = Math.max(0, timing.completeAt - timing.firstArrivalAt);
+    const captureToDisplayMs = Number.isFinite(clockOffsetMs) && Number.isFinite(timing.capturedUnixMs)
+      ? Math.max(0, nowWall - (timing.capturedUnixMs + clockOffsetMs))
+      : null;
+    const encodedToDisplayMs = Number.isFinite(clockOffsetMs) && Number.isFinite(timing.encodedUnixMs)
+      ? Math.max(0, nowWall - (timing.encodedUnixMs + clockOffsetMs))
+      : null;
     if (elapsed >= 1000) {
       fpsWindowStartedAt = nowPerf;
       fpsWindowFrames = 0;
@@ -296,7 +297,7 @@ function createDecoder(config) {
   decoder = new VideoDecoder({
     output: onDecodedFrame,
     error(error) {
-      console.warn("RemotePlay fast-video WebCodecs decoder error", error);
+      debugWarn("RemotePlay fast-video WebCodecs decoder error", error);
       resetForLoss("browser_fast_video_decoder_error");
     },
   });
@@ -357,8 +358,11 @@ async function decodeAssembly(assembly) {
   let data = converted.data;
   let metadata = h264Metadata(data);
   const key = assembly.keyframe || metadata.key;
-  data = prependCachedParameterSets(data, metadata, key);
-  metadata = h264Metadata(data);
+  const preparedData = prependCachedParameterSets(data, metadata, key);
+  if (preparedData !== data) {
+    data = preparedData;
+    metadata = h264Metadata(data);
+  }
 
   if (waitingForKeyframe && !key) return false;
   if (key && metadata.codec && decoderConfig?.codec !== metadata.codec) {
@@ -554,6 +558,7 @@ function onChunk(buffer) {
 
 async function start(data) {
   if (typeof VideoDecoder !== "function") throw new Error("WebCodecs VideoDecoder is not available in this browser");
+  debugLogging = data.debugLogging === true;
   canvas = data.canvas;
   context = canvas.getContext("2d", { alpha: false, desynchronized: true });
   if (!context) throw new Error("Could not create desynchronized canvas context");
