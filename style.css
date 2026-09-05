@@ -69,6 +69,39 @@ h2 { margin-bottom: 0; font-size: 1.18rem; }
   backdrop-filter: none;
 }
 .stage { position: relative; aspect-ratio: 16 / 9; overflow: hidden; background: #02060b; }
+.stage.pseudo-fullscreen {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  width: 100vw;
+  width: 100dvw;
+  height: 100vh;
+  height: 100dvh;
+  max-height: none !important;
+  aspect-ratio: auto !important;
+  background: #000;
+}
+body.pseudo-fullscreen-active { overflow: hidden; overscroll-behavior: none; }
+.fullscreen-exit {
+  position: absolute;
+  z-index: 8;
+  top: max(12px, env(safe-area-inset-top));
+  right: max(12px, env(safe-area-inset-right));
+  display: none;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid rgb(255 255 255 / 22%);
+  border-radius: 10px;
+  background: rgb(0 0 0 / 68%);
+  color: #fff;
+  font-size: .75rem;
+  font-weight: 800;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+.stage.pseudo-fullscreen .fullscreen-exit,
+.stage:fullscreen .fullscreen-exit,
+.stage:-webkit-full-screen .fullscreen-exit { display: block; }
 video, .video-canvas {
   display: block;
   width: 100%;
@@ -159,21 +192,168 @@ input::placeholder { color: #5e7187; }
 .controller-label .pulse { margin: 0 6px 11px 0; }
 .note { margin: 10px 0 0; color: var(--muted); font-size: .74rem; line-height: 1.55; }
 
-.virtual-pad { display: none; margin-top: 12px; padding: 12px; border: 1px solid var(--line); background: rgb(5 13 23 / 94%); touch-action: none; user-select: none; }
+.virtual-pad {
+  display: none;
+  margin-top: 12px;
+  padding: clamp(10px, 2.5vw, 18px);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgb(5 13 23 / 96%);
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-tap-highlight-color: transparent;
+  overscroll-behavior: contain;
+}
+.virtual-pad *, .virtual-pad *::before, .virtual-pad *::after {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-user-drag: none;
+  -webkit-tap-highlight-color: transparent;
+}
 .mobile-mode .virtual-pad { display: block; }
-.pad-shoulders, .pad-main, .pad-center { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.pad-shoulders { margin-bottom: 12px; }
-.pad-center { align-self: stretch; flex-direction: column; justify-content: center; }
-.pad-button { display: grid; place-items: center; min-width: 54px; min-height: 48px; border: 1px solid rgb(159 190 224 / 28%); border-radius: 13px; background: linear-gradient(145deg, #17283b, #0a1422); color: #dcecff; font-weight: 850; box-shadow: 0 4px 0 #03070d; touch-action: none; }
-.pad-button.is-pressed { transform: translateY(3px); border-color: var(--cyan); background: #18394b; box-shadow: 0 1px 0 #03070d; color: var(--cyan); }
-.pad-shoulders .pad-button { flex: 1; min-height: 42px; }
-.dpad, .face-pad { display: grid; grid-template: repeat(3, 58px) / repeat(3, 58px); gap: 3px; }
+
+.pad-shoulders {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: clamp(18px, 9vw, 90px);
+  margin-bottom: clamp(14px, 3vw, 24px);
+}
+.shoulder-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(58px, 1fr));
+  gap: clamp(8px, 1.7vw, 14px);
+  width: min(38%, 300px);
+}
+.shoulder-right { margin-left: auto; }
+
+.pad-main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
+  align-items: center;
+  justify-items: center;
+  gap: clamp(10px, 3vw, 34px);
+}
+.pad-center {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: clamp(7px, 1.4vw, 11px);
+  align-content: center;
+  justify-items: center;
+}
+
+.pad-button {
+  display: grid;
+  place-items: center;
+  min-width: 54px;
+  min-height: 48px;
+  padding: 0 10px;
+  border: 1px solid rgb(159 190 224 / 30%);
+  border-radius: 13px;
+  background: linear-gradient(145deg, #17283b, #0a1422);
+  color: #dcecff;
+  font-weight: 850;
+  box-shadow: 0 4px 0 #03070d;
+  touch-action: none;
+  cursor: default;
+}
+.pad-button.is-pressed {
+  transform: translateY(3px);
+  border-color: var(--cyan);
+  background: #18394b;
+  box-shadow: 0 1px 0 #03070d;
+  color: var(--cyan);
+}
+.shoulder-group .pad-button { width: 100%; min-height: 44px; }
+.pad-system {
+  min-width: clamp(62px, 11vw, 94px);
+  min-height: clamp(34px, 6vw, 42px);
+  font-size: clamp(.56rem, 1.7vw, .72rem);
+}
+
+.dpad, .face-pad {
+  --pad-cell: clamp(46px, 12vw, 68px);
+  position: relative;
+  display: grid;
+  grid-template: repeat(3, var(--pad-cell)) / repeat(3, var(--pad-cell));
+  gap: clamp(2px, .7vw, 5px);
+  touch-action: none;
+}
+.dpad { padding: 3px; border-radius: 18px; }
+.dpad::after {
+  content: "";
+  grid-area: 2 / 2;
+  width: 66%;
+  height: 66%;
+  place-self: center;
+  border-radius: 10px;
+  background: rgb(23 40 59 / 72%);
+  pointer-events: none;
+}
 .dpad [data-button="12"], .face-pad [data-button="3"] { grid-area: 1 / 2; }
 .dpad [data-button="14"], .face-pad [data-button="2"] { grid-area: 2 / 1; }
 .dpad [data-button="15"], .face-pad [data-button="1"] { grid-area: 2 / 3; }
 .dpad [data-button="13"], .face-pad [data-button="0"] { grid-area: 3 / 2; }
-.dpad .pad-button, .face-pad .pad-button { min-width: 58px; min-height: 58px; }
-.pad-center .pad-button { min-width: 84px; min-height: 38px; font-size: .68rem; }
+.dpad .pad-button, .face-pad .pad-button {
+  min-width: var(--pad-cell);
+  min-height: var(--pad-cell);
+  padding: 0;
+  font-size: clamp(.85rem, 3vw, 1.15rem);
+}
+.face-pad .pad-button { border-radius: 50%; }
+
+.stick-row {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 28px;
+  margin-top: clamp(18px, 4vw, 30px);
+  padding: 0 clamp(8px, 4vw, 52px) 4px;
+}
+.analog-stick {
+  display: grid;
+  justify-items: center;
+  gap: 7px;
+  touch-action: none;
+}
+.analog-stick > span {
+  color: #8fa7bf;
+  font-size: .58rem;
+  font-weight: 800;
+  letter-spacing: .08em;
+}
+.stick-ring {
+  position: relative;
+  width: clamp(112px, 24vw, 168px);
+  aspect-ratio: 1;
+  border: 3px solid rgb(159 190 224 / 36%);
+  border-radius: 50%;
+  background:
+    radial-gradient(circle at 50% 50%, rgb(87 228 255 / 5%), transparent 62%),
+    #08111d;
+  box-shadow: inset 0 0 24px rgb(0 0 0 / 42%), 0 8px 26px rgb(0 0 0 / 24%);
+  touch-action: none;
+}
+.stick-knob {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 50%;
+  aspect-ratio: 1;
+  border: 2px solid rgb(159 190 224 / 36%);
+  border-radius: 50%;
+  background: linear-gradient(145deg, #1a2c40, #0b1624);
+  box-shadow: 0 7px 16px rgb(0 0 0 / 38%);
+  transform: translate(-50%, -50%);
+  will-change: transform;
+  pointer-events: none;
+}
+.analog-stick.is-active .stick-ring { border-color: rgb(87 228 255 / 70%); }
+.analog-stick.is-active .stick-knob { border-color: var(--cyan); }
+
 .mobile-mode .shell { width: min(100% - 16px, 1180px); padding-top: 12px; }
 .mobile-mode header { margin-bottom: 10px; }
 .mobile-mode .stage { max-height: 52vh; }
@@ -206,16 +386,24 @@ footer { display: flex; justify-content: space-between; padding: 22px 4px 0; col
   .heading { display: block; }
   .heading > p { margin-top: 10px; text-align: left; }
   .stage { aspect-ratio: 16 / 10; }
-  .dpad, .face-pad { grid-template: repeat(3, 48px) / repeat(3, 48px); }
-  .dpad .pad-button, .face-pad .pad-button { min-width: 48px; min-height: 48px; }
-  .pad-center .pad-button { min-width: 62px; }
+  .pad-shoulders { gap: 16px; }
+  .shoulder-group { width: 42%; }
+  .pad-main { gap: 6px; }
+  .dpad, .face-pad { --pad-cell: clamp(44px, 13vw, 54px); }
+  .stick-row { padding-inline: 4px; }
+  .stick-ring { width: clamp(108px, 29vw, 138px); }
 }
 
 @media (max-width: 430px) {
-  .pad-main { gap: 4px; }
-  .dpad, .face-pad { grid-template: repeat(3, 46px) / repeat(3, 42px); }
-  .dpad .pad-button, .face-pad .pad-button { min-width: 42px; min-height: 46px; }
-  .pad-center .pad-button { min-width: 48px; padding: 0 4px; font-size: .58rem; }
+  .virtual-pad { padding-inline: 7px; }
+  .pad-main { grid-template-columns: minmax(0, 1fr) 46px minmax(0, 1fr); gap: 2px; }
+  .dpad, .face-pad { --pad-cell: clamp(36px, 12vw, 44px); gap: 1px; }
+  .dpad { padding: 1px; }
+  .pad-system { min-width: 44px; padding: 0 2px; font-size: .5rem; }
+  .shoulder-group { grid-template-columns: repeat(2, minmax(50px, 1fr)); width: 44%; gap: 6px; }
+  .shoulder-group .pad-button { min-width: 0; padding: 0 5px; }
+  .stick-ring { width: clamp(102px, 31vw, 124px); }
+  .stick-row { padding-inline: 8px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

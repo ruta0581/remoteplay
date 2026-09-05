@@ -22,6 +22,15 @@ const FAST_VIDEO_FIRST_FRAME_TIMEOUT_MS = 3_000;
 const NETWORK_MODES = ["auto", "ipv6_direct", "stun"];
 const MAX_EXTERNAL_POOL_CANDIDATES = 32;
 const DEBUG_LOGGING = new URLSearchParams(window.location.search).get("debug") === "1";
+const USER_AGENT = navigator.userAgent || "";
+const IS_ANDROID_FIREFOX = /Android/i.test(USER_AGENT) && /Firefox\//i.test(USER_AGENT);
+const IS_IOS = /iP(?:hone|ad|od)/i.test(USER_AGENT) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+// Firefox for Android can establish the PeerConnection while the optional
+// OffscreenCanvas/WebCodecs fast path never produces a frame. Force its proven
+// native WebRTC H.264 decoder path instead of waiting on browser-only workers.
+const FORCE_NATIVE_RTP_VIDEO = IS_ANDROID_FIREFOX;
+const ANALOG_STICK_DEADZONE = 0.08;
 
 const debugLog = (...args) => {
   if (DEBUG_LOGGING) console.debug(...args);
@@ -49,8 +58,10 @@ const element = {
   audio: byId("audio"),
   resync: byId("resync"),
   fullscreen: byId("fullscreen"),
+  fullscreenExit: byId("fullscreenExit"),
   mobileMode: byId("mobileMode"),
   mobilePad: byId("mobilePad"),
+  dpad: byId("dpad"),
   gamepad: byId("gamepad"),
   gamepadHelp: byId("gamepadHelp"),
   inputPulse: byId("inputPulse"),
@@ -64,7 +75,7 @@ const element = {
 };
 
 const virtualGamepadState = {
-  id: "RemotePlay Mobile Digital Pad",
+  id: "RemotePlay Mobile Gamepad",
   mapping: "standard",
   buttons: Array.from({ length: 16 }, () => ({ pressed: false, value: 0 })),
   axes: new Float32Array(4),
@@ -137,6 +148,7 @@ const state = {
   virtualButtons: new Array(16).fill(0),
   virtualCounts: new Array(16).fill(0),
   virtualPointers: new Map(),
+  stickPointers: new Map(),
 };
 
 function setStatus(kind, label, title, detail) {
@@ -335,16 +347,28 @@ async function createPeer(generation, networkMode, stunServers) {
       maxPacketLifeTime: 50,
     });
     const control = peer.createDataChannel("control", { ordered: true });
+    state.inputChannel = input;
+    state.controlChannel = control;
+    configureInputChannel(input, generation);
+    configureControlChannel(control, generation);
+
     const fastVideo = peer.createDataChannel(FAST_VIDEO_CHANNEL_LABEL, {
       ordered: false,
       maxRetransmits: 0,
     });
-    state.inputChannel = input;
-    state.controlChannel = control;
     state.fastVideoChannel = fastVideo;
-    configureInputChannel(input, generation);
-    configureControlChannel(control, generation);
-    configureFastVideoChannel(fastVideo, generation);
+    if (FORCE_NATIVE_RTP_VIDEO) {
+      state.fastVideoDisabled = true;
+      fastVideo.binaryType = "arraybuffer";
+      fastVideo.onopen = () => {
+        debugLog("Android Firefox detected: closing optional fast-video channel and using native WebRTC H.264");
+        try { fastVideo.close(); } catch (_) {}
+      };
+      fastVideo.onclose = () => {};
+      fastVideo.onerror = () => {};
+    } else {
+      configureFastVideoChannel(fastVideo, generation);
+    }
 
     const video = peer.addTransceiver("video", { direction: "recvonly" });
     preferH264(video);
@@ -411,6 +435,10 @@ function startStoredVideoFallback(generation) {
   const track = state.fastVideoTrack;
   const receiver = state.fastVideoReceiver;
   if (!track || !receiver) return false;
+  if (FORCE_NATIVE_RTP_VIDEO) {
+    startHtmlVideoFallback(track, generation);
+    return true;
+  }
   if (!startEncodedWebCodecsRenderer(receiver, track, generation) &&
       !startLowLatencyVideoRenderer(track, generation)) {
     startHtmlVideoFallback(track, generation);
@@ -638,9 +666,25 @@ function startHtmlVideoFallback(track, generation) {
   state.videoRenderer = "video";
   element.stage.classList.remove("low-latency-canvas");
   if (element.videoCanvas) element.videoCanvas.hidden = true;
-  addTrackOnce(state.videoStream, track);
+
+  // Reassign a stream that already contains the track. Firefox Android can
+  // leave an HTMLVideoElement attached to an initially-empty MediaStream in a
+  // non-rendering state when the track is added later. Rebinding also keeps
+  // autoplay predictable because this element is permanently muted; audio is
+  // rendered by the separate <audio> element.
+  state.videoStream = new MediaStream([track]);
+  element.video.srcObject = state.videoStream;
+  element.video.muted = true;
+  element.video.setAttribute("playsinline", "");
+  element.video.setAttribute("webkit-playsinline", "");
   element.video.playbackRate = 1;
-  element.video.play().catch(onVideoAutoplayBlocked);
+
+  const startPlayback = () => {
+    if (generation !== state.generation) return;
+    element.video.play().catch(onVideoAutoplayBlocked);
+  };
+  startPlayback();
+  if (track.muted) track.addEventListener("unmute", startPlayback, { once: true });
   monitorVideoFrames(generation);
 }
 
@@ -1409,6 +1453,7 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
 
   if (preserved) Object.assign(state, preserved);
 
+  if (element.stage.classList.contains("pseudo-fullscreen")) exitPseudoFullscreen();
   resetVirtualPad();
   element.inputPulse.classList.remove("active");
   element.video.pause();
@@ -1677,7 +1722,7 @@ function refreshPads(force = false) {
 
   element.gamepad.replaceChildren();
   element.gamepad.add(new Option("コントローラーなし（映像のみ）", ""));
-  if (state.mobile) element.gamepad.add(new Option("スマホ仮想デジタルパッド", "virtual"));
+  if (state.mobile) element.gamepad.add(new Option("スマホ仮想ゲームパッド", "virtual"));
   pads.forEach((pad) => element.gamepad.add(new Option(`#${pad.index + 1} ${pad.id}`, String(pad.index))));
 
   const previousExists =
@@ -1688,7 +1733,7 @@ function refreshPads(force = false) {
   element.gamepad.value = state.padIndex === null ? "" : String(state.padIndex);
   element.gamepadHelp.textContent =
     state.padIndex === "virtual"
-      ? "画面下の仮想パッドを使用します。接続後は変更できません。"
+      ? "画面下の仮想パッド（十字キー＋左右スティック）を使用します。接続後は変更できません。"
       : pads.length
         ? `${pads.length}台検出 / 接続後はコントローラーを変更できません。`
         : "コントローラーのボタンを一度押すと、ブラウザが検出します。";
@@ -1809,36 +1854,241 @@ function sendPadDisconnected() {
   sendInput(gamepadPayload(pad, false));
 }
 
+function syncVirtualButtonVisual(index) {
+  const pressed = state.virtualButtons[index] > 0;
+  element.mobilePad
+    .querySelectorAll(`[data-button="${index}"]`)
+    .forEach((button) => button.classList.toggle("is-pressed", pressed));
+}
+
+function beginVirtualPointer(pointerId, owner, type) {
+  if (state.virtualPointers.has(pointerId)) return false;
+  state.virtualPointers.set(pointerId, { owner, type, indices: new Set() });
+  return true;
+}
+
+function updateVirtualPointerButtons(pointerId, indices) {
+  const active = state.virtualPointers.get(pointerId);
+  if (!active) return;
+  const next = new Set(indices);
+  const changed = new Set([...active.indices, ...next]);
+
+  for (const index of active.indices) {
+    if (!next.has(index)) {
+      state.virtualCounts[index] = Math.max(0, state.virtualCounts[index] - 1);
+      state.virtualButtons[index] = state.virtualCounts[index] > 0 ? 1 : 0;
+    }
+  }
+  for (const index of next) {
+    if (!active.indices.has(index)) {
+      state.virtualCounts[index] += 1;
+      state.virtualButtons[index] = 1;
+    }
+  }
+  active.indices = next;
+  changed.forEach(syncVirtualButtonVisual);
+
+  if (next.size) {
+    state.lastInputAt = performance.now();
+    updateInputPulse();
+  }
+}
+
+function endVirtualPointer(pointerId) {
+  const active = state.virtualPointers.get(pointerId);
+  if (!active) return;
+  updateVirtualPointerButtons(pointerId, []);
+  state.virtualPointers.delete(pointerId);
+}
+
+function resetStick(root, stickIndex) {
+  const base = stickIndex * 2;
+  virtualGamepadState.axes[base] = 0;
+  virtualGamepadState.axes[base + 1] = 0;
+  const knob = root?.querySelector(".stick-knob");
+  if (knob) knob.style.transform = "translate(-50%, -50%)";
+  root?.classList.remove("is-active");
+}
+
 function resetVirtualPad() {
   state.virtualButtons.fill(0);
   state.virtualCounts.fill(0);
   state.virtualPointers.clear();
+  state.stickPointers.clear();
+  virtualGamepadState.axes.fill(0);
   element.mobilePad.querySelectorAll(".is-pressed").forEach((button) => button.classList.remove("is-pressed"));
+  element.mobilePad.querySelectorAll(".analog-stick").forEach((root) => {
+    resetStick(root, Number(root.dataset.stick));
+  });
 }
 
 function pressVirtualButton(event) {
   event.preventDefault();
   if (event.pointerType === "mouse" && event.button !== 0) return;
-  if (state.virtualPointers.has(event.pointerId)) return;
   const button = event.currentTarget;
   const index = Number(button.dataset.button);
+  if (!Number.isInteger(index) || !beginVirtualPointer(event.pointerId, button, "button")) return;
   button.setPointerCapture?.(event.pointerId);
-  state.virtualPointers.set(event.pointerId, { index, button });
-  state.virtualCounts[index] += 1;
-  state.virtualButtons[index] = 1;
-  button.classList.add("is-pressed");
-  state.lastInputAt = performance.now();
-  updateInputPulse();
+  updateVirtualPointerButtons(event.pointerId, [index]);
 }
 
 function releaseVirtualButton(event) {
-  const active = state.virtualPointers.get(event.pointerId);
-  if (!active) return;
-  state.virtualPointers.delete(event.pointerId);
-  state.virtualCounts[active.index] = Math.max(0, state.virtualCounts[active.index] - 1);
-  state.virtualButtons[active.index] = state.virtualCounts[active.index] > 0 ? 1 : 0;
-  if (!state.virtualButtons[active.index]) active.button.classList.remove("is-pressed");
+  if (!state.virtualPointers.has(event.pointerId)) return;
+  endVirtualPointer(event.pointerId);
   event.preventDefault();
+}
+
+function dpadButtonsForPoint(clientX, clientY) {
+  const rect = element.dpad.getBoundingClientRect();
+  const halfWidth = Math.max(1, rect.width / 2);
+  const halfHeight = Math.max(1, rect.height / 2);
+  const dx = (clientX - (rect.left + halfWidth)) / halfWidth;
+  const dy = (clientY - (rect.top + halfHeight)) / halfHeight;
+  const ax = Math.abs(dx);
+  const ay = Math.abs(dy);
+  if (Math.hypot(dx, dy) < 0.16) return [];
+
+  const buttons = [];
+  // A broad diagonal zone makes sliding around the cross continuous instead of
+  // dropping input in the gaps between the four visible buttons.
+  if (ay >= ax * 0.55) buttons.push(dy < 0 ? 12 : 13);
+  if (ax >= ay * 0.55) buttons.push(dx < 0 ? 14 : 15);
+  return buttons;
+}
+
+function updateDpadPointer(event) {
+  const active = state.virtualPointers.get(event.pointerId);
+  if (!active || active.type !== "dpad") return;
+  updateVirtualPointerButtons(event.pointerId, dpadButtonsForPoint(event.clientX, event.clientY));
+  event.preventDefault();
+}
+
+function pressDpad(event) {
+  event.preventDefault();
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+  if (!beginVirtualPointer(event.pointerId, element.dpad, "dpad")) return;
+  element.dpad.setPointerCapture?.(event.pointerId);
+  updateDpadPointer(event);
+}
+
+function releaseDpad(event) {
+  const active = state.virtualPointers.get(event.pointerId);
+  if (!active || active.type !== "dpad") return;
+  endVirtualPointer(event.pointerId);
+  event.preventDefault();
+}
+
+function stickValuesForPoint(root, clientX, clientY) {
+  const ring = root.querySelector(".stick-ring");
+  const rect = ring.getBoundingClientRect();
+  const radius = Math.max(1, Math.min(rect.width, rect.height) / 2);
+  const dx = (clientX - (rect.left + rect.width / 2)) / radius;
+  const dy = (clientY - (rect.top + rect.height / 2)) / radius;
+  const magnitude = Math.hypot(dx, dy);
+  const clampScale = magnitude > 1 ? 1 / magnitude : 1;
+  const visualX = dx * clampScale;
+  const visualY = dy * clampScale;
+
+  if (magnitude <= ANALOG_STICK_DEADZONE) {
+    return { x: 0, y: 0, visualX, visualY, rect };
+  }
+  const clampedMagnitude = Math.min(1, magnitude);
+  const outputMagnitude = (clampedMagnitude - ANALOG_STICK_DEADZONE) / (1 - ANALOG_STICK_DEADZONE);
+  const nx = dx / magnitude;
+  const ny = dy / magnitude;
+  return { x: nx * outputMagnitude, y: ny * outputMagnitude, visualX, visualY, rect };
+}
+
+function updateStickPointer(event) {
+  const active = state.stickPointers.get(event.pointerId);
+  if (!active) return;
+  const { root, stickIndex } = active;
+  const values = stickValuesForPoint(root, event.clientX, event.clientY);
+  const base = stickIndex * 2;
+  virtualGamepadState.axes[base] = Math.max(-1, Math.min(1, values.x));
+  virtualGamepadState.axes[base + 1] = Math.max(-1, Math.min(1, values.y));
+
+  const knob = root.querySelector(".stick-knob");
+  if (knob) {
+    const travel = values.rect.width * 0.25;
+    knob.style.transform = `translate(-50%, -50%) translate(${values.visualX * travel}px, ${values.visualY * travel}px)`;
+  }
+  root.classList.add("is-active");
+  if (Math.abs(values.x) > 0.01 || Math.abs(values.y) > 0.01) {
+    state.lastInputAt = performance.now();
+    updateInputPulse();
+  }
+  event.preventDefault();
+}
+
+function pressStick(event) {
+  event.preventDefault();
+  if (event.pointerType === "mouse" && event.button !== 0) return;
+  const root = event.currentTarget;
+  const stickIndex = Number(root.dataset.stick);
+  if (!Number.isInteger(stickIndex)) return;
+  if ([...state.stickPointers.values()].some((active) => active.stickIndex === stickIndex)) return;
+  state.stickPointers.set(event.pointerId, { root, stickIndex });
+  root.setPointerCapture?.(event.pointerId);
+  updateStickPointer(event);
+}
+
+function releaseStick(event) {
+  const active = state.stickPointers.get(event.pointerId);
+  if (!active) return;
+  state.stickPointers.delete(event.pointerId);
+  resetStick(active.root, active.stickIndex);
+  event.preventDefault();
+}
+
+function enterPseudoFullscreen() {
+  element.stage.classList.add("pseudo-fullscreen");
+  document.body.classList.add("pseudo-fullscreen-active");
+  updateFullscreenUi();
+}
+
+function exitPseudoFullscreen() {
+  element.stage.classList.remove("pseudo-fullscreen");
+  document.body.classList.remove("pseudo-fullscreen-active");
+  updateFullscreenUi();
+}
+
+function nativeFullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+
+function updateFullscreenUi() {
+  const active = Boolean(nativeFullscreenElement()) || element.stage.classList.contains("pseudo-fullscreen");
+  element.fullscreen.textContent = active ? "全画面解除" : "全画面";
+}
+
+async function toggleFullscreen() {
+  if (nativeFullscreenElement()) {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen;
+    try { await exit?.call(document); } catch (error) { debugLog("Could not exit fullscreen", error); }
+    updateFullscreenUi();
+    return;
+  }
+  if (element.stage.classList.contains("pseudo-fullscreen")) {
+    exitPseudoFullscreen();
+    return;
+  }
+
+  // iPhone Safari does not expose a usable arbitrary-element Fullscreen API.
+  // Prefer the standard API when it exists; otherwise use a viewport-filling
+  // stage so the same button still behaves as fullscreen without launching the
+  // native video player (which would hide the virtual controller).
+  const request = element.stage.requestFullscreen || element.stage.webkitRequestFullscreen;
+  if (request && !IS_IOS) {
+    try {
+      await request.call(element.stage);
+      updateFullscreenUi();
+      return;
+    } catch (error) {
+      debugLog("Fullscreen API failed; using pseudo fullscreen", error);
+    }
+  }
+  enterPseudoFullscreen();
 }
 
 function addressFromPageUrl() {
@@ -1880,13 +2130,34 @@ element.mobileMode.addEventListener("click", () => {
   refreshPads(true);
 });
 
-element.mobilePad.querySelectorAll("[data-button]").forEach((button) => {
+element.mobilePad.querySelectorAll("[data-button]:not(.dpad-button)").forEach((button) => {
   button.addEventListener("pointerdown", pressVirtualButton);
   button.addEventListener("pointerup", releaseVirtualButton);
   button.addEventListener("pointercancel", releaseVirtualButton);
   button.addEventListener("lostpointercapture", releaseVirtualButton);
-  button.addEventListener("contextmenu", (event) => event.preventDefault());
 });
+
+element.dpad.addEventListener("pointerdown", pressDpad);
+element.dpad.addEventListener("pointermove", updateDpadPointer);
+element.dpad.addEventListener("pointerup", releaseDpad);
+element.dpad.addEventListener("pointercancel", releaseDpad);
+element.dpad.addEventListener("lostpointercapture", releaseDpad);
+
+element.mobilePad.querySelectorAll(".analog-stick").forEach((stick) => {
+  stick.addEventListener("pointerdown", pressStick);
+  stick.addEventListener("pointermove", updateStickPointer);
+  stick.addEventListener("pointerup", releaseStick);
+  stick.addEventListener("pointercancel", releaseStick);
+  stick.addEventListener("lostpointercapture", releaseStick);
+});
+
+// Safari's long-press callout/selection can still appear even with user-select
+// disabled. Cancel the legacy touch/selection paths only inside the controller.
+["contextmenu", "selectstart", "dragstart"].forEach((type) => {
+  element.mobilePad.addEventListener(type, (event) => event.preventDefault());
+});
+element.mobilePad.addEventListener("touchstart", (event) => event.preventDefault(), { passive: false });
+element.mobilePad.addEventListener("touchmove", (event) => event.preventDefault(), { passive: false });
 
 element.audio.addEventListener("click", () => {
   element.audioOut.muted = !element.audioOut.muted;
@@ -1894,10 +2165,10 @@ element.audio.addEventListener("click", () => {
   if (!element.audioOut.muted) element.audioOut.play().catch(onAudioAutoplayBlocked);
 });
 element.resync.addEventListener("click", resyncVideo);
-element.fullscreen.addEventListener("click", () => {
-  if (document.fullscreenElement) void document.exitFullscreen();
-  else void element.stage.requestFullscreen?.();
-});
+element.fullscreen.addEventListener("click", () => void toggleFullscreen());
+element.fullscreenExit.addEventListener("click", () => void toggleFullscreen());
+document.addEventListener("fullscreenchange", updateFullscreenUi);
+document.addEventListener("webkitfullscreenchange", updateFullscreenUi);
 element.video.addEventListener("click", () => {
   element.video.play().catch(onVideoAutoplayBlocked);
   if (!element.audioOut.muted) element.audioOut.play().catch(onAudioAutoplayBlocked);
@@ -1932,6 +2203,10 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden && state.connected) requestKeyframe("browser_became_visible");
 });
 
+element.video.muted = true;
+element.video.setAttribute("playsinline", "");
+element.video.setAttribute("webkit-playsinline", "");
+updateFullscreenUi();
 document.body.classList.toggle("low-power", lowPower);
 if (element.protocolVersion) element.protocolVersion.textContent = PROTOCOL_VERSION;
 element.url.value = addressFromPageUrl();
