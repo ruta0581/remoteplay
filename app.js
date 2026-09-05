@@ -1082,9 +1082,8 @@ function externalPoolCandidates(values) {
     const port = Number(match[2]);
     if (!isPublicIpv4(ip) || port < 1 || port > 65535 || seen.has(value)) continue;
     seen.add(value);
-    const priority = 1694498815 - result.length;
     result.push({
-      candidate: `candidate:rpweb${result.length} 1 udp ${priority} ${ip} ${port} typ srflx`,
+      candidate: `candidate:rpweb${result.length} 1 udp 1694498815 ${ip} ${port} typ srflx`,
       sdpMid: "0",
       sdpMLineIndex: 0,
       _remotePlayExternal: true,
