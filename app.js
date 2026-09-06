@@ -5,14 +5,14 @@
 const PROTOCOL_VERSION = "1";
 
 const CONNECTION_TIMEOUT_MS = 45_000;
-const ICE_ROUTE_TIMEOUT_MS = 4_000;
+const ICE_ROUTE_TIMEOUT_MS = 8_000;
 const WELCOME_TIMEOUT_MS = 10_000;
 const AUDIO_JITTER_TARGET_MS = 20;
 const VIDEO_JITTER_TARGET_MS = 0;
 const VIDEO_PLAYOUT_DELAY_SECONDS = VIDEO_JITTER_TARGET_MS / 1_000;
 const RECONNECT_GRACE_MS = 5_000;
 const RETRY_BASE_MS = 1_000;
-const RETRY_MAX_MS = 10_000;
+const RETRY_MAX_MS = 2_000;
 const NETWORK_FEEDBACK_INTERVAL_MS = 2_000;
 const MAX_INPUT_BUFFER_BYTES = 64 * 1024;
 const VIDEO_STALL_MS = 2_000;
@@ -1232,7 +1232,7 @@ async function openRouteAttempt() {
     state.reconnectAttempt > 0 ? `再試行 ${state.reconnectAttempt}` : "接続中",
     "ホストへ接続しています",
     state.reconnectAttempt > 0
-      ? `同じSTUNセッションで再接続しています（${state.reconnectAttempt}回目）`
+      ? `新しい通信経路も探して再接続しています（${state.reconnectAttempt}回目）`
       : "WebSocketシグナリングを開始しています",
   );
 
