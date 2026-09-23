@@ -2,7 +2,7 @@
 
 // Change this manually when intentionally breaking Host/Guest compatibility.
 // Do not auto-increment this value for ordinary code changes.
-const PROTOCOL_VERSION = "1";
+const PROTOCOL_VERSION = "1.1";
 
 const CONNECTION_TIMEOUT_MS = 45_000;
 const ICE_ROUTE_TIMEOUT_MS = 8_000;
@@ -15,6 +15,11 @@ const RETRY_BASE_MS = 1_000;
 const RETRY_MAX_MS = 2_000;
 const NETWORK_FEEDBACK_INTERVAL_MS = 2_000;
 const MAX_INPUT_BUFFER_BYTES = 64 * 1024;
+const STANDARD_GAMEPAD_BUTTON_COUNT = 16;
+const STANDARD_GAMEPAD_AXIS_COUNT = 4;
+const PAD_NEUTRAL_RETRY_INTERVAL_MS = 100;
+const PAD_NEUTRAL_RETRY_COUNT = 10;
+const PAD_NEUTRAL_RETRY_MAX_MS = 3_000;
 const VIDEO_STALL_MS = 2_000;
 const VIDEO_STALL_REQUEST_COOLDOWN_MS = 3_000;
 const FAST_VIDEO_CHANNEL_LABEL = "video-fast";
@@ -131,6 +136,11 @@ const state = {
   statsTimer: null,
   syncTimer: null,
   padFrame: null,
+  padNeutralTimer: null,
+  padNeutralRemaining: 0,
+  padNeutralDeadline: 0,
+  padMissing: false,
+  gamepadSeq: 0,
   padIndex: null,
   padChoiceExplicit: false,
   lockedPad: null,
@@ -969,6 +979,9 @@ function configureInputChannel(channel, generation) {
   channel.bufferedAmountLowThreshold = 16 * 1024;
   channel.onopen = () => {
     if (generation !== state.generation) return;
+    // Sequence numbers are scoped to this input DataChannel. They allow the
+    // Host to discard late unordered packets from an older controller state.
+    state.gamepadSeq = 0;
     sendInput({ type: "decoder_status", backend: "browser" });
     // The fast-video DataChannel needs its own first IDR. Avoid requesting an
     // RTP-track IDR just before that channel opens; if the fast path fails, its
@@ -1162,7 +1175,7 @@ async function handleSignal(raw, generation) {
           await state.peer.addIceCandidate(candidate);
         } catch (error) {
           if (!candidate._remotePlayExternal) throw error;
-          debugWarn("Host external STUN candidate was rejected", candidate.candidate, error);
+          debugWarn("Host external STUN candidate was rejected", error);
         }
       }
       clearTimeout(state.connectionTimer);
@@ -1192,7 +1205,7 @@ async function handleSignal(raw, generation) {
           try {
             await state.peer.addIceCandidate(candidate);
           } catch (error) {
-            debugWarn("Host external STUN candidate was rejected", candidate.candidate, error);
+            debugWarn("Host external STUN candidate was rejected", error);
           }
         } else {
           state.remoteCandidates.push(candidate);
@@ -1299,6 +1312,18 @@ async function start() {
   }
 
   const selectedPad = padSelection(element.gamepad.value);
+  if (Number.isInteger(selectedPad)) {
+    const selectedGamepad = navigator.getGamepads?.()[selectedPad];
+    if (!selectedGamepad) {
+      element.error.textContent = "選択したコントローラーが見つかりません。再接続して選び直してください。";
+      refreshPads(true);
+      return;
+    }
+    if (selectedGamepad.mapping !== "standard") {
+      element.error.textContent = "このコントローラーはブラウザのstandard mappingに対応していないため使用できません。";
+      return;
+    }
+  }
   const name = element.name.value.trim() || "ブラウザゲスト";
   await teardown(false, false);
   state.baseUrl = url;
@@ -1307,6 +1332,7 @@ async function start() {
   state.guestName = name;
   state.lockedPad = selectedPad;
   state.padIndex = selectedPad;
+  state.padMissing = false;
   element.url.value = url;
   await openRouteAttempt();
 }
@@ -1366,6 +1392,7 @@ async function teardown(notify, showIdle, reason = "切断しました", preserv
   clearTimeout(state.welcomeTimer);
   clearTimeout(state.reconnectTimer);
   clearTimeout(state.retryTimer);
+  cancelPadNeutralRetry();
   clearFastVideoTimers();
   clearInterval(state.statsTimer);
   clearInterval(state.syncTimer);
@@ -1726,7 +1753,7 @@ function padSelection(value) {
 function refreshPads(force = false) {
   if (connectionActive() && !force) return;
   const pads = Array.from(navigator.getGamepads?.() || []).filter(Boolean);
-  const signature = `${state.mobile}|${pads.map((pad) => `${pad.index}:${pad.id}`).join("|")}`;
+  const signature = `${state.mobile}|${pads.map((pad) => `${pad.index}:${pad.id}:${pad.mapping}`).join("|")}`;
   const previous = state.padIndex;
   if (!force && signature === state.padSignature) return;
   state.padSignature = signature;
@@ -1734,36 +1761,75 @@ function refreshPads(force = false) {
   element.gamepad.replaceChildren();
   element.gamepad.add(new Option("コントローラーなし（映像のみ）", ""));
   if (state.mobile) element.gamepad.add(new Option("スマホ仮想ゲームパッド", "virtual"));
-  pads.forEach((pad) => element.gamepad.add(new Option(`#${pad.index + 1} ${pad.id}`, String(pad.index))));
+  pads.forEach((pad) => {
+    const supported = pad.mapping === "standard";
+    const option = new Option(
+      `#${pad.index + 1} ${pad.id}${supported ? "" : "（非standard・未対応）"}`,
+      String(pad.index),
+    );
+    option.disabled = !supported;
+    element.gamepad.add(option);
+  });
 
   const previousExists =
     (previous === null && state.padChoiceExplicit) ||
     (previous === "virtual" && state.mobile) ||
-    (Number.isInteger(previous) && pads.some((pad) => pad.index === previous));
-  state.padIndex = previousExists ? previous : state.mobile ? "virtual" : (pads[0]?.index ?? null);
+    (Number.isInteger(previous) && pads.some((pad) => pad.index === previous && pad.mapping === "standard"));
+  const firstSupportedPad = pads.find((pad) => pad.mapping === "standard");
+  state.padIndex = previousExists
+    ? previous
+    : state.mobile
+      ? "virtual"
+      : (firstSupportedPad?.index ?? null);
   element.gamepad.value = state.padIndex === null ? "" : String(state.padIndex);
   element.gamepadHelp.textContent =
     state.padIndex === "virtual"
       ? "画面下の仮想パッド（十字キー＋左右スティック）を使用します。接続後は変更できません。"
-      : pads.length
-        ? `${pads.length}台検出 / 接続後はコントローラーを変更できません。`
-        : "コントローラーのボタンを一度押すと、ブラウザが検出します。";
+      : pads.some((pad) => pad.mapping === "standard")
+        ? `${pads.filter((pad) => pad.mapping === "standard").length}台対応 / 接続後はコントローラーを変更できません。`
+        : pads.length
+          ? "検出したパッドはGamepad APIのstandard mappingではないため使用できません。"
+          : "コントローラーのボタンを一度押すと、ブラウザが検出します。";
+}
+
+function nextGamepadSeq() {
+  state.gamepadSeq += 1;
+  // Number.MAX_SAFE_INTEGER is effectively unreachable at a 100 ms heartbeat,
+  // but keep the wire value an exact JSON integer if a tab somehow lives forever.
+  if (!Number.isSafeInteger(state.gamepadSeq) || state.gamepadSeq <= 0) state.gamepadSeq = 1;
+  return state.gamepadSeq;
 }
 
 function gamepadPayload(pad, connected = true) {
-  const sourceButtons = pad?.buttons || [];
-  const sourceAxes = pad?.axes || [];
+  const seq = nextGamepadSeq();
+  if (!connected) {
+    return {
+      type: "gamepad",
+      seq,
+      gamepad: {
+        id: pad?.id || "Browser Gamepad",
+        connected: false,
+        mapping: "standard",
+        buttons: Array.from({ length: STANDARD_GAMEPAD_BUTTON_COUNT }, () => ({ pressed: false, value: 0 })),
+        axes: Array(STANDARD_GAMEPAD_AXIS_COUNT).fill(0),
+      },
+    };
+  }
+
+  const sourceButtons = Array.from(pad?.buttons || []).slice(0, STANDARD_GAMEPAD_BUTTON_COUNT);
+  const sourceAxes = Array.from(pad?.axes || []).slice(0, STANDARD_GAMEPAD_AXIS_COUNT);
   return {
     type: "gamepad",
+    seq,
     gamepad: {
       id: pad?.id || "Browser Gamepad",
-      connected,
-      mapping: pad?.mapping || "standard",
-      buttons: Array.from(sourceButtons, (button) => ({
+      connected: true,
+      mapping: pad?.mapping || "",
+      buttons: sourceButtons.map((button) => ({
         pressed: button.pressed,
         value: Math.round(button.value * 1_000) / 1_000,
       })),
-      axes: Array.from(sourceAxes.slice(0, 4), (axis) => Math.round(axis * 1_000) / 1_000),
+      axes: sourceAxes.map((axis) => Math.round(axis * 1_000) / 1_000),
     },
   };
 }
@@ -1784,17 +1850,17 @@ function encodedButton(button) {
 
 function padChanged(pad) {
   const previous = state.lastPad;
-  const axisCount = Math.min(4, pad.axes.length);
+  const axisCount = Math.min(STANDARD_GAMEPAD_AXIS_COUNT, pad.axes.length);
   if (
     !previous ||
     previous.id !== pad.id ||
     previous.mapping !== pad.mapping ||
-    previous.buttons.length !== pad.buttons.length ||
+    previous.buttons.length !== Math.min(STANDARD_GAMEPAD_BUTTON_COUNT, pad.buttons.length) ||
     previous.axes.length !== axisCount
   ) {
     return true;
   }
-  for (let index = 0; index < pad.buttons.length; index += 1) {
+  for (let index = 0; index < Math.min(STANDARD_GAMEPAD_BUTTON_COUNT, pad.buttons.length); index += 1) {
     if (previous.buttons[index] !== encodedButton(pad.buttons[index])) return true;
   }
   for (let index = 0; index < axisCount; index += 1) {
@@ -1804,11 +1870,11 @@ function padChanged(pad) {
 }
 
 function rememberPad(pad) {
-  const axisCount = Math.min(4, pad.axes.length);
+  const axisCount = Math.min(STANDARD_GAMEPAD_AXIS_COUNT, pad.axes.length);
   state.lastPad = {
     id: pad.id,
     mapping: pad.mapping,
-    buttons: Array.from(pad.buttons, encodedButton),
+    buttons: Array.from(pad.buttons).slice(0, STANDARD_GAMEPAD_BUTTON_COUNT).map(encodedButton),
     axes: Array.from(pad.axes.slice(0, axisCount), (axis) => Math.round(axis * 1_000)),
   };
 }
@@ -1833,14 +1899,20 @@ function pollPad() {
     state.lockedPad === "virtual"
       ? virtualPad()
       : navigator.getGamepads?.()[state.lockedPad];
-  if (!pad) {
+  if (!pad || (state.lockedPad !== "virtual" && pad.mapping !== "standard")) {
+    if (!state.padMissing) {
+      state.padMissing = true;
+      sendPadDisconnected();
+    }
     updateInputPulse();
     return;
   }
+  state.padMissing = false;
 
   const now = performance.now();
   if (padChanged(pad) || now - state.lastPadAt >= 100) {
     if (sendInput(gamepadPayload(pad))) {
+      cancelPadNeutralRetry();
       rememberPad(pad);
       state.lastPadAt = now;
     }
@@ -1859,10 +1931,41 @@ function updateInputPulse() {
   }
 }
 
+function cancelPadNeutralRetry() {
+  if (state.padNeutralTimer !== null) clearInterval(state.padNeutralTimer);
+  state.padNeutralTimer = null;
+  state.padNeutralRemaining = 0;
+  state.padNeutralDeadline = 0;
+}
+
 function sendPadDisconnected() {
   if (state.inputChannel?.readyState !== "open" || state.lockedPad === null) return;
   const pad = state.lockedPad === "virtual" ? virtualPad() : navigator.getGamepads?.()[state.lockedPad];
-  sendInput(gamepadPayload(pad, false));
+  const payload = gamepadPayload(pad, false);
+
+  cancelPadNeutralRetry();
+  state.padNeutralRemaining = PAD_NEUTRAL_RETRY_COUNT;
+  state.padNeutralDeadline = performance.now() + PAD_NEUTRAL_RETRY_MAX_MS;
+  const sendNeutral = () => {
+    if (
+      state.inputChannel?.readyState !== "open" ||
+      state.padNeutralRemaining <= 0 ||
+      performance.now() >= state.padNeutralDeadline
+    ) {
+      cancelPadNeutralRetry();
+      return;
+    }
+    // Count only payloads actually accepted by the DataChannel API. If the
+    // bounded input queue is congested, keep retrying until the short deadline
+    // instead of consuming all retries while nothing was queued.
+    if (sendInput(payload)) state.padNeutralRemaining -= 1;
+    if (state.padNeutralRemaining <= 0) cancelPadNeutralRetry();
+  };
+
+  sendNeutral();
+  if (state.padNeutralRemaining > 0) {
+    state.padNeutralTimer = setInterval(sendNeutral, PAD_NEUTRAL_RETRY_INTERVAL_MS);
+  }
 }
 
 function syncVirtualButtonVisual(index) {
@@ -2201,7 +2304,10 @@ window.addEventListener("gamepadconnected", () => {
 });
 window.addEventListener("gamepaddisconnected", (event) => {
   if (connectionActive()) {
-    if (state.lockedPad === event.gamepad.index) sendPadDisconnected();
+    if (state.lockedPad === event.gamepad.index) {
+      state.padMissing = true;
+      sendPadDisconnected();
+    }
   } else {
     refreshPads();
   }
